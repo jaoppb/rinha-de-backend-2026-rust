@@ -16,9 +16,7 @@ services:
           memory: '40M'
 
   data-loader:
-    build:
-      context: .
-      dockerfile: data/Dockerfile
+    image: jaoppb/rinha-2026-data-loader:latest
     ipc: shareable
     shm_size: '184mb'
     deploy:
@@ -28,9 +26,7 @@ services:
           memory: '200M'
 
   api1: &api
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
+    image: jaoppb/rinha-2026-rust:latest
     ipc: service:data-loader
     environment:
       - SOCK=/dev/shm/api1.sock
