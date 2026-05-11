@@ -9,12 +9,6 @@ pub struct Record {
 }
 
 #[repr(C)]
-pub struct MccRisk {
-    pub mcc: u16,
-    pub risk: f32,
-}
-
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Normalization {
     pub max_amount: f32,
@@ -26,25 +20,34 @@ pub struct Normalization {
     pub max_merchant_avg_amount: f32,
 }
 
+// Include the generated data
+include!(concat!(env!("OUT_DIR"), "/generated_lookups.rs"));
+
 pub struct Dataset {
-    _mmap: Mmap, // Kept to ensure the memory stays mapped
+    _mmap: Mmap,
     pub records: &'static [Record],
 }
 
+pub struct IvfData {
+    _centroids_mmap: Mmap,
+    _indices_mmap: Mmap,
+    _offsets_mmap: Mmap,
+    pub centroids: &'static [[f32; 14]],
+    pub indices: &'static [u32],
+    pub offsets: &'static [u32],
+}
+
 pub struct LookupData {
-    pub mcc_risks: [f32; 65536],
-    pub normalization: Normalization,
+    pub mcc_risks: &'static [f32; 65536],
+    pub normalization: &'static Normalization,
 }
 
 pub fn load_dataset() -> std::io::Result<Dataset> {
-    let file = File::open("/dev/shm/dataset.bin")?;
+    let file = File::open("/data/shared/dataset.bin")?;
     let mmap = unsafe { Mmap::map(&file)? };
     let ptr = mmap.as_ptr() as *const Record;
     let len = mmap.len() / std::mem::size_of::<Record>();
 
-    // Safety: The mmap lives for the duration of the Dataset struct.
-    // We transmute to 'static because this dataset is global and intended
-    // to live for the process duration.
     let records = unsafe { std::slice::from_raw_parts(ptr, len) };
     let records_static = unsafe { std::mem::transmute::<&[Record], &'static [Record]>(records) };
 
@@ -54,29 +57,50 @@ pub fn load_dataset() -> std::io::Result<Dataset> {
     })
 }
 
-pub fn load_lookups() -> std::io::Result<LookupData> {
-    // Load MCC Risk
-    let mut mcc_risks = [0.5f32; 65536]; // Default risk is 0.5
-    let mcc_file = File::open("/dev/shm/mcc_risk.bin")?;
-    let mcc_mmap = unsafe { Mmap::map(&mcc_file)? };
+pub fn load_ivf_data() -> std::io::Result<IvfData> {
+    let centroids_file = File::open("/data/shared/centroids.bin")?;
+    let centroids_mmap = unsafe { Mmap::map(&centroids_file)? };
+    
+    let indices_file = File::open("/data/shared/indices.bin")?;
+    let indices_mmap = unsafe { Mmap::map(&indices_file)? };
+    
+    let offsets_file = File::open("/data/shared/offsets.bin")?;
+    let offsets_mmap = unsafe { Mmap::map(&offsets_file)? };
 
-    let mcc_record_size = std::mem::size_of::<MccRisk>();
-    let mcc_len = mcc_mmap.len() / mcc_record_size;
-    let mcc_records: &[MccRisk] =
-        unsafe { std::slice::from_raw_parts(mcc_mmap.as_ptr() as *const MccRisk, mcc_len) };
+    let centroids = unsafe {
+        std::slice::from_raw_parts(
+            centroids_mmap.as_ptr() as *const [f32; 14],
+            centroids_mmap.len() / std::mem::size_of::<[f32; 14]>(),
+        )
+    };
 
-    for record in mcc_records {
-        mcc_risks[record.mcc as usize] = record.risk;
-    }
+    let indices = unsafe {
+        std::slice::from_raw_parts(
+            indices_mmap.as_ptr() as *const u32,
+            indices_mmap.len() / 4,
+        )
+    };
 
-    // Load Normalization
-    let norm_file = File::open("/dev/shm/normalization.bin")?;
-    let norm_mmap = unsafe { Mmap::map(&norm_file)? };
-    let normalization: Normalization =
-        unsafe { std::ptr::read(norm_mmap.as_ptr() as *const Normalization) };
+    let offsets = unsafe {
+        std::slice::from_raw_parts(
+            offsets_mmap.as_ptr() as *const u32,
+            offsets_mmap.len() / 4,
+        )
+    };
 
-    Ok(LookupData {
-        mcc_risks,
-        normalization,
+    Ok(IvfData {
+        _centroids_mmap: centroids_mmap,
+        _indices_mmap: indices_mmap,
+        _offsets_mmap: offsets_mmap,
+        centroids: unsafe { std::mem::transmute(centroids) },
+        indices: unsafe { std::mem::transmute(indices) },
+        offsets: unsafe { std::mem::transmute(offsets) },
     })
+}
+
+pub fn load_lookups() -> LookupData {
+    LookupData {
+        mcc_risks: &MCC_RISKS,
+        normalization: &NORMALIZATION,
+    }
 }

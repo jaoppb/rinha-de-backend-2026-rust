@@ -6,3 +6,11 @@ edition = "2024"
 [dependencies]
 memmap2 = "0.9.10"
 monoio = "0.2.4"
+
+[build-dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[features]
+default = []
+verbose = []

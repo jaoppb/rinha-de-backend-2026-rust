@@ -12,12 +12,12 @@ use std::time::Duration;
 use crate::http_parser::{HttpRoute, parse_http_request};
 use crate::json_parser::parse_json_payload;
 use crate::knn::IvfIndex;
-use crate::mmap::{LookupData, load_dataset, load_lookups};
+use crate::mmap::{load_dataset, load_ivf_data, load_lookups};
 use crate::vectorizer::vectorize;
 
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "verbose"))]
         {
             println!($($arg)*);
             let _ = std::io::stdout().flush();
@@ -25,26 +25,39 @@ macro_rules! debug_log {
     };
 }
 fn main() {
-    // 1. Wait for shared memory files
-    debug_log!("Waiting for datasets in /dev/shm...");
+    println!("Starting API with embedded lookups...");
+    let lookups = Rc::new(load_lookups());
 
-    let (dataset, lookups) = loop {
-        match (load_dataset(), load_lookups()) {
-            (Ok(d), Ok(l)) => break (d, l),
-            _ => {
+    println!("Waiting for shared datasets in /data/shared (dataset.bin, centroids.bin, indices.bin, offsets.bin)...");
+    let (dataset, ivf_data) = loop {
+        match (load_dataset(), load_ivf_data()) {
+            (Ok(d), Ok(i)) => {
+                println!("Successfully loaded all datasets.");
+                break (d, i);
+            }
+            (Err(e), _) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Keep waiting
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            (Err(e), _) => {
+                println!("Error loading dataset: {:?}", e);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Keep waiting
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            (_, Err(e)) => {
+                println!("Error loading IVF data: {:?}", e);
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
     };
 
-    debug_log!("Building IVF index...");
-    let index = IvfIndex::build(dataset.records);
-
-    let lookups = Rc::new(lookups);
-    let index = Rc::new(index);
+    debug_log!("Initializing pre-computed IVF index...");
+    let index = Rc::new(IvfIndex::new(ivf_data));
     let dataset_records = dataset.records;
 
-    // 2. Start monoio runtime
     let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .with_entries(1024)
         .enable_timer()
@@ -64,7 +77,6 @@ fn main() {
         debug_log!("Ready on unix:{}", sock_path);
         loop {
             let (conn, _) = listener.accept().await.unwrap();
-            debug_log!("Accepted connection");
             let lookups = lookups.clone();
             let index = index.clone();
             monoio::spawn(async move {
@@ -79,12 +91,11 @@ impl Stream for monoio::net::UnixStream {}
 
 async fn handle_connection<S: Stream>(
     mut conn: S,
-    lookups: Rc<LookupData>,
+    lookups: Rc<crate::mmap::LookupData>,
     index: Rc<IvfIndex>,
     records: &'static [crate::mmap::Record],
 ) {
     debug_log!("New connection received");
-    let start = std::time::Instant::now();
     let buf = vec![0u8; 4096];
     let (res, buf) = conn.read(buf).await;
     let n = match res {
@@ -92,7 +103,14 @@ async fn handle_connection<S: Stream>(
             debug_log!("Read {} bytes", n);
             n
         }
-        _ => return,
+        Ok(_) => {
+            debug_log!("Read 0 bytes, closing");
+            return;
+        }
+        Err(e) => {
+            debug_log!("Read error: {:?}", e);
+            return;
+        }
     };
 
     let route = parse_http_request(&buf[..n]);
@@ -103,20 +121,21 @@ async fn handle_connection<S: Stream>(
             let _ = conn.write_all(response).await;
         }
         HttpRoute::FraudScore(body) => {
-            debug_log!("Handling /fraud-score with body size {}", body.len());
+            debug_log!("Handling /fraud-score, body length: {}", body.len());
             if body.is_empty() {
+                debug_log!("Empty body received");
                 let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
                 let _ = conn.write_all(response).await;
                 return;
             }
 
             if let Some(tx) = parse_json_payload(body) {
-                debug_log!("Parsed payload successfully");
+                debug_log!("Parsed JSON payload successfully");
                 if let Some(vec) = vectorize(&tx, &lookups) {
-                    debug_log!("Vectorized payload successfully");
+                    debug_log!("Vectorized successfully");
                     let (approved, score) = index.search(&vec, records);
-                    debug_log!("Search completed: approved={}, score={}", approved, score);
-
+                    debug_log!("Search results: approved={}, score={}", approved, score);
+                    
                     let resp_body =
                         format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
                     let response = format!(
@@ -126,22 +145,21 @@ async fn handle_connection<S: Stream>(
                     );
                     let _ = conn.write_all(response.into_bytes()).await;
                 } else {
-                    debug_log!("Failed to vectorize payload");
+                    debug_log!("Vectorization failed");
                     let response =
                         b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
                     let _ = conn.write_all(response).await;
                 }
             } else {
-                debug_log!("Failed to parse payload");
+                debug_log!("JSON parsing failed for body: {:?}", std::str::from_utf8(body).unwrap_or("invalid utf8"));
                 let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
                 let _ = conn.write_all(response).await;
             }
         }
         HttpRoute::NotFound => {
-            debug_log!("Handling Not Found");
+            debug_log!("Route not found");
             let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
             let _ = conn.write_all(response).await;
         }
     }
-    debug_log!("Request processed in {:?}", start.elapsed());
 }
