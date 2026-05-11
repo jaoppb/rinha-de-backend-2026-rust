@@ -5,10 +5,8 @@ mod mmap;
 mod vectorizer;
 
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
-use std::time::Duration;
 
 use crate::http_parser::{HttpRoute, parse_http_request};
 use crate::json_parser::parse_json_payload;
@@ -97,9 +95,6 @@ async fn handle_connection<S: Stream>(
 
         // Process all complete requests in the buffer
         while !main_buf.is_empty() {
-            #[cfg(any(debug_assertions, feature = "verbose"))]
-            let t_req_start = std::time::Instant::now();
-
             let (route, consumed) = parse_http_request(&main_buf);
 
             match route {
@@ -112,54 +107,25 @@ async fn handle_connection<S: Stream>(
                     let _ = conn.write_all(response).await;
                 }
                 HttpRoute::FraudScore(body) => {
-                    let (index, records) = &*state;
-                    if body.is_empty() {
-                        let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-                        let _ = conn.write_all(response).await;
-                    } else {
-                        let tx = parse_json_payload(body);
-                        #[cfg(any(debug_assertions, feature = "verbose"))]
-                        let t_parse = t_req_start.elapsed();
-
-                        if let Some(tx) = tx {
-                            let vec = vectorize(&tx, &lookups);
-                            #[cfg(any(debug_assertions, feature = "verbose"))]
-                            let t_vectorize = t_req_start.elapsed();
-
-                            if let Some(vec) = vec {
-                                let (approved, score) = index.search(&vec, records);
-                                #[cfg(any(debug_assertions, feature = "verbose"))]
-                                let t_search = t_req_start.elapsed();
-
-                                let resp_body =
-                                    format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                                    resp_body.len(),
-                                    resp_body
-                                );
-                                let _ = conn.write_all(response.into_bytes()).await;
-
-                                #[cfg(any(debug_assertions, feature = "verbose"))]
-                                {
-                                    let t_total = t_req_start.elapsed();
-                                    println!(
-                                        "REQ: proc={:?}, parse={:?}, vec={:?}, search={:?}, write={:?}",
-                                        t_total,
-                                        t_parse,
-                                        t_vectorize - t_parse,
-                                        t_search - t_vectorize,
-                                        t_total - t_search
-                                    );
-                                }
-                            } else {
-                                let response =
-                                    b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
-                                let _ = conn.write_all(response).await;
-                            }
-                        } else {
-                            let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-                            let _ = conn.write_all(response).await;
+                    let tx = (!body.is_empty()).then(|| parse_json_payload(body)).flatten();
+                    match tx.as_ref().map(|t| vectorize(t, &lookups)) {
+                        Some(Some(vec)) => {
+                            let (index, records) = &*state;
+                            let (approved, score) = index.search(&vec, records);
+                            let resp_body =
+                                format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                resp_body.len(),
+                                resp_body
+                            );
+                            let _ = conn.write_all(response.into_bytes()).await;
+                        }
+                        Some(None) => {
+                            let _ = conn.write_all(b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n").await;
+                        }
+                        None => {
+                            let _ = conn.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await;
                         }
                     }
                 }
