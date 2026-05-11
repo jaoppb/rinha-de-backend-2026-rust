@@ -24,7 +24,7 @@ services:
       resources:
         limits:
           cpus: '0.01'
-          memory: '10M'
+          memory: '230M'
 
   api1: &api
     image: jaoppb/rinha-2026-rust:latest
@@ -36,7 +36,7 @@ services:
       resources:
         limits:
           cpus: '0.39'
-          memory: '50M'
+          memory: '40M'
 
   api2:
     <<: *api
@@ -49,4 +49,4 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: "size=210m"
+      o: "size=230m"
