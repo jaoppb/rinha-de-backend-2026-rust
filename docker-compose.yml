@@ -14,7 +14,7 @@ services:
       resources:
         limits:
           cpus: '0.2'
-          memory: '40M'
+          memory: '30M'
 
   data-loader:
     image: jaoppb/rinha-2026-data-loader:latest
@@ -24,7 +24,7 @@ services:
       resources:
         limits:
           cpus: '0.01'
-          memory: '200M'
+          memory: '10M'
 
   api1: &api
     image: jaoppb/rinha-2026-rust:latest
@@ -36,7 +36,7 @@ services:
       resources:
         limits:
           cpus: '0.39'
-          memory: '55M'
+          memory: '50M'
 
   api2:
     <<: *api
