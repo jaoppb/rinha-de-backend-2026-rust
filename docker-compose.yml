@@ -13,8 +13,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.1'
-          memory: '40M'
+          cpus: '0.2'
+          memory: '60M'
 
   data-loader:
     image: jaoppb/rinha-2026-data-loader:latest

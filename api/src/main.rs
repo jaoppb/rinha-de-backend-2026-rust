@@ -96,70 +96,97 @@ async fn handle_connection<S: Stream>(
     records: &'static [crate::mmap::Record],
 ) {
     debug_log!("New connection received");
-    let buf = vec![0u8; 4096];
-    let (res, buf) = conn.read(buf).await;
-    let n = match res {
-        Ok(n) if n > 0 => {
-            debug_log!("Read {} bytes", n);
-            n
-        }
-        Ok(_) => {
-            debug_log!("Read 0 bytes, closing");
-            return;
-        }
-        Err(e) => {
-            debug_log!("Read error: {:?}", e);
-            return;
-        }
-    };
+    let mut main_buf = Vec::with_capacity(4096);
+    let mut read_buf = vec![0u8; 4096];
 
-    let route = parse_http_request(&buf[..n]);
-    match route {
-        HttpRoute::Ready => {
-            debug_log!("Handling /ready");
-            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-            let _ = conn.write_all(response).await;
-        }
-        HttpRoute::FraudScore(body) => {
-            debug_log!("Handling /fraud-score, body length: {}", body.len());
-            if body.is_empty() {
-                debug_log!("Empty body received");
-                let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-                let _ = conn.write_all(response).await;
+    loop {
+        let (res, buf_returned) = conn.read(read_buf).await;
+        read_buf = buf_returned;
+
+        match res {
+            Ok(n) if n > 0 => {
+                main_buf.extend_from_slice(&read_buf[..n]);
+            }
+            _ => {
+                debug_log!("Connection closed or error");
                 return;
             }
+        }
 
-            if let Some(tx) = parse_json_payload(body) {
-                debug_log!("Parsed JSON payload successfully");
-                if let Some(vec) = vectorize(&tx, &lookups) {
-                    debug_log!("Vectorized successfully");
-                    let (approved, score) = index.search(&vec, records);
-                    debug_log!("Search results: approved={}, score={}", approved, score);
-                    
-                    let resp_body =
-                        format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(),
-                        resp_body
-                    );
-                    let _ = conn.write_all(response.into_bytes()).await;
-                } else {
-                    debug_log!("Vectorization failed");
-                    let response =
-                        b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
+        // Process all complete requests in the buffer
+        while !main_buf.is_empty() {
+            #[cfg(any(debug_assertions, feature = "verbose"))]
+            let t_req_start = std::time::Instant::now();
+
+            let (route, consumed) = parse_http_request(&main_buf);
+
+            match route {
+                HttpRoute::Incomplete => {
+                    break;
+                }
+                HttpRoute::Ready => {
+                    debug_log!("Handling /ready");
+                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
                     let _ = conn.write_all(response).await;
                 }
-            } else {
-                debug_log!("JSON parsing failed for body: {:?}", std::str::from_utf8(body).unwrap_or("invalid utf8"));
-                let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-                let _ = conn.write_all(response).await;
+                HttpRoute::FraudScore(body) => {
+                    if body.is_empty() {
+                        let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                        let _ = conn.write_all(response).await;
+                    } else {
+                        let tx = parse_json_payload(body);
+                        #[cfg(any(debug_assertions, feature = "verbose"))]
+                        let t_parse = t_req_start.elapsed();
+
+                        if let Some(tx) = tx {
+                            let vec = vectorize(&tx, &lookups);
+                            #[cfg(any(debug_assertions, feature = "verbose"))]
+                            let t_vectorize = t_req_start.elapsed();
+
+                            if let Some(vec) = vec {
+                                let (approved, score) = index.search(&vec, records);
+                                #[cfg(any(debug_assertions, feature = "verbose"))]
+                                let t_search = t_req_start.elapsed();
+
+                                let resp_body =
+                                    format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                    resp_body.len(),
+                                    resp_body
+                                );
+                                let _ = conn.write_all(response.into_bytes()).await;
+
+                                #[cfg(any(debug_assertions, feature = "verbose"))]
+                                {
+                                    let t_total = t_req_start.elapsed();
+                                    println!(
+                                        "REQ: proc={:?}, parse={:?}, vec={:?}, search={:?}, write={:?}",
+                                        t_total,
+                                        t_parse,
+                                        t_vectorize - t_parse,
+                                        t_search - t_vectorize,
+                                        t_total - t_search
+                                    );
+                                }
+                            } else {
+                                let response =
+                                    b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
+                                let _ = conn.write_all(response).await;
+                            }
+                        } else {
+                            let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                            let _ = conn.write_all(response).await;
+                        }
+                    }
+                }
+                HttpRoute::NotFound => {
+                    let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                    let _ = conn.write_all(response).await;
+                }
             }
-        }
-        HttpRoute::NotFound => {
-            debug_log!("Route not found");
-            let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-            let _ = conn.write_all(response).await;
+
+            main_buf.drain(..consumed);
         }
     }
 }
