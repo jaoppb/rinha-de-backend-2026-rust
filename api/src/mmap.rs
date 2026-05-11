@@ -2,6 +2,7 @@ use memmap2::Mmap;
 use std::fs::File;
 
 #[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
 pub struct Record {
     pub vector: [f32; 14], // 56 bytes
     pub label: u8,         // 1 byte
@@ -43,7 +44,7 @@ pub struct LookupData {
 }
 
 pub fn load_dataset() -> std::io::Result<Dataset> {
-    let file = File::open("/data/shared/dataset.bin")?;
+    let file = File::open("/app/data/dataset.bin")?;
     let mmap = unsafe { Mmap::map(&file)? };
     let ptr = mmap.as_ptr() as *const Record;
     let len = mmap.len() / std::mem::size_of::<Record>();
@@ -58,13 +59,13 @@ pub fn load_dataset() -> std::io::Result<Dataset> {
 }
 
 pub fn load_ivf_data() -> std::io::Result<IvfData> {
-    let centroids_file = File::open("/data/shared/centroids.bin")?;
+    let centroids_file = File::open("/app/data/centroids.bin")?;
     let centroids_mmap = unsafe { Mmap::map(&centroids_file)? };
     
-    let indices_file = File::open("/data/shared/indices.bin")?;
+    let indices_file = File::open("/app/data/indices.bin")?;
     let indices_mmap = unsafe { Mmap::map(&indices_file)? };
     
-    let offsets_file = File::open("/data/shared/offsets.bin")?;
+    let offsets_file = File::open("/app/data/offsets.bin")?;
     let offsets_mmap = unsafe { Mmap::map(&offsets_file)? };
 
     let centroids = unsafe {

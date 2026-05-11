@@ -4,12 +4,10 @@ DOCKER_COMPOSE = docker-compose
 K6_IMAGE = grafana/k6
 PWD = $(shell pwd)
 API_IMAGE = jaoppb/rinha-2026-rust:latest
-DATA_LOADER_IMAGE = jaoppb/rinha-2026-data-loader:latest
 
 # Core build target
 build-images:
 	docker build -t $(API_IMAGE) --build-arg INPUT_FILE=$(INPUT_FILE) --build-arg CARGO_FEATURES=$(CARGO_FEATURES) .
-	docker build -t $(DATA_LOADER_IMAGE) --build-arg INPUT_FILE=$(INPUT_FILE) -f data/Dockerfile .
 
 # Default dev build: verbose profile + example data
 build:
@@ -46,7 +44,6 @@ test-submission:
 
 docker-push: build-release
 	docker push $(API_IMAGE)
-	docker push $(DATA_LOADER_IMAGE)
 
 run-all: restart
 	sleep 5

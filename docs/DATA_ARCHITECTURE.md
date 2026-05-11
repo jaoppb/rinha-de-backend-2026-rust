@@ -1,16 +1,14 @@
 # Data Architecture
 
-This document describes the optimized data loading and storage strategy used for the Rinha de Backend 2026.
+This document describes the integrated indexing and data loading strategy used for the Rinha de Backend 2026.
 
 ## Overview
 
-The dataset (`references.json.gz`) is converted from a compressed JSON format into a high-performance, cache-line aligned binary format during the Docker build phase. This binary data is then served via shared memory (`/dev/shm`) to the Rust API instances.
+The dataset (`references.json.gz`) is processed during the **Docker build phase** by a dedicated Rust `indexer`. This tool converts raw JSON records into optimized binary formats (`.bin`) and builds an IVF (Inverted File) index. These binary artifacts are baked directly into the container image, eliminating the need for a separate data-loader service or shared `tmpfs` volumes for the dataset.
 
 ## Binary Format (Flat Records)
 
-Each record in `dataset.bin` is exactly **64 bytes** long. This size is chosen to match the standard CPU cache line size, ensuring that a single memory fetch retrieves exactly one record, maximizing L1/L2 cache efficiency during KNN searches.
-
-### Memory Layout per Record
+Each record in `dataset.bin` is exactly **64 bytes** long. This size matches the standard CPU cache line size, maximizing L1/L2 cache efficiency during KNN searches.
 
 | Offset (Bytes) | Size (Bytes) | Type      | Description                          |
 | -------------- | ------------ | --------- | ------------------------------------ |
@@ -18,102 +16,31 @@ Each record in `dataset.bin` is exactly **64 bytes** long. This size is chosen t
 | 56             | 1            | `u8`      | Label (`0 = legit`, `1 = fraud`)     |
 | 57             | 7            | Padding   | Zero-filled padding for 64B alignment |
 
-### Total Size
-The final main dataset is approximately **183.1 MB**, stored as a contiguous array of these 64-byte structures.
+## IVF Index Artifacts
 
-## Auxiliary Data
+The indexer generates four primary files in `/app/data/`:
+1.  **`dataset.bin`**: The raw record data (approx. 183 MB for the full dataset).
+2.  **`centroids.bin`**: 256 cluster centroids (14x f32 each).
+3.  **`indices.bin`**: Mapping of cluster assignments to dataset indices.
+4.  **`offsets.bin`**: Start/end positions for each cluster in the indices array.
 
-In addition to the main vector dataset, two auxiliary files are converted to binary to eliminate runtime JSON parsing.
+## Data Loading Strategy
 
-### MCC Risk (`mcc_risk.bin`)
+The Rust API uses the `memmap2` crate to map these files from the local container filesystem at startup.
 
-Stored as a flat list of `(u16, f32)` pairs.
-- **`u16`**: MCC code (2 bytes)
-- **`f32`**: Risk factor (4 bytes)
-- **Total Record Size**: 6 bytes
+### Zero-Copy Access
+By using `mmap`, the OS maps the file directly into the process's virtual memory space.
+- **Memory Efficiency**: The 183MB dataset does not consume the API's heap.
+- **Shared Page Cache**: Because multiple API instances share the same underlying Docker layers on the host, the Linux kernel naturally shares the page cache for these files across containers.
 
-### Normalization Constants (`normalization.bin`)
+### Health Checks
+The API is considered "ready" only after all four binary files have been successfully mapped and the IVF index is initialized. HAProxy monitors the `/ready` endpoint to ensure traffic is only routed to fully initialized instances.
 
-Stored as a single block of 7 `f32` values (28 bytes). The values are stored in the following fixed order:
-1. `max_amount`
-2. `max_installments`
-3. `amount_vs_avg_ratio`
-4. `max_minutes`
-5. `max_km`
-6. `max_tx_count_24h`
-7. `max_merchant_avg_amount`
+## Build Process
 
-## Data Loader Service
+1.  **Indexer Build**: The `indexer` project is compiled.
+2.  **Data Generation**: The `indexer` runs against the input JSON, producing the `.bin` files in `/app/data`.
+3.  **API Build**: The `api` project is compiled.
+4.  **Image Assembly**: The final slim image copies the `api` binary and the `/app/data` artifacts.
 
-The `data-loader` service (defined in `docker-compose.yml`) performs the following:
-
-1.  **Conversion:** Runs `data/convert.py` during `docker build`.
-2.  **Shared Memory:** At runtime, it copies the `.bin` files to `/dev/shm/`.
-3.  **IPC:** It is configured with `ipc: shareable`, allowing other containers to attach to its IPC namespace.
-
-**Note:** The `data-loader` service must be configured with `shm_size: '184mb'` in `docker-compose.yml`. The default Docker `/dev/shm` size (64MB) is insufficient for the 183.1MB dataset.
-
-## Accessing from Rust API
-
-The Rust API containers are configured with `ipc: service:data-loader`. This allows them to access the same `/dev/shm` space.
-
-### Recommended Integration Strategy
-
-To achieve zero-copy performance, the Rust API should use the `memmap2` crate. Below are the recommended struct definitions and mapping logic.
-
-#### Struct Definitions
-
-```rust
-#[repr(C, align(64))]
-pub struct Record {
-    pub vector: [f32; 14], // 56 bytes
-    pub label: u8,         // 1 byte
-    _padding: [u8; 7],     // 7 bytes
-}
-
-#[repr(C)]
-pub struct MccRisk {
-    pub mcc: u16,
-    pub risk: f32,
-}
-
-#[repr(C)]
-pub struct Normalization {
-    pub max_amount: f32,
-    pub max_installments: f32,
-    pub amount_vs_avg_ratio: f32,
-    pub max_minutes: f32,
-    pub max_km: f32,
-    pub max_tx_count_24h: f32,
-    pub max_merchant_avg_amount: f32,
-}
-```
-
-#### Mapping Logic
-
-```rust
-use memmap2::Mmap;
-use std::fs::File;
-
-// 1. Main Dataset
-let file = File::open("/dev/shm/dataset.bin")?;
-let mmap = unsafe { Mmap::map(&file)? };
-let records: &[Record] = unsafe {
-    std::slice::from_raw_parts(mmap.as_ptr() as *const Record, mmap.len() / 64)
-};
-
-// 2. MCC Risk (Small enough to read into a Map or keep as slice)
-let mcc_file = File::open("/dev/shm/mcc_risk.bin")?;
-let mcc_mmap = unsafe { Mmap::map(&mcc_file)? };
-let mcc_risks: &[MccRisk] = unsafe {
-    std::slice::from_raw_parts(mcc_mmap.as_ptr() as *const MccRisk, mcc_mmap.len() / 6)
-};
-
-// 3. Normalization Constants
-let norm_bytes = std::fs::read("/dev/shm/normalization.bin")?;
-let normalization: &Normalization = unsafe {
-    &*(norm_bytes.as_ptr() as *const Normalization)
-};
-```
-
-This approach allows the API to perform KNN searches directly on the shared memory without allocating 183MB on its own heap, staying well within the 160MB RAM limit.
+This self-contained architecture ensures consistent performance, simplified deployment, and zero external dependencies at runtime.
