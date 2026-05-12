@@ -15,7 +15,7 @@ services:
           memory: '30M'
 
   api1: &api
-    image: jaoppb/rinha-2026-rust:latest
+    build: .
     volumes:
       - shared-data:/data/shared
     environment:
@@ -37,4 +37,4 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: "size=1m"
+      o: 'size=1m'
