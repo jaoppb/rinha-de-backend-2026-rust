@@ -1,9 +1,7 @@
 services:
-  haproxy:
-    image: haproxy:alpine
-    user: root
+  lb:
+    build: ./lb
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - shared-data:/data/shared
     ports:
       - '9999:9999'
