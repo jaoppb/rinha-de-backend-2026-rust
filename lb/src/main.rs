@@ -52,6 +52,8 @@ struct Connection {
     backend_addr: Box<libc::sockaddr_un>,
     active: bool,
     closing: bool,
+    client_eof: bool,
+    backend_eof: bool,
     pending_ops: usize,
 }
 
@@ -61,6 +63,8 @@ impl Connection {
         self.backend_fd = -1;
         self.active = false;
         self.closing = false;
+        self.client_eof = false;
+        self.backend_eof = false;
         self.pending_ops = 0;
     }
 }
@@ -80,6 +84,8 @@ fn main() -> std::io::Result<()> {
             backend_addr: Box::new(unsafe { std::mem::zeroed() }),
             active: false,
             closing: false,
+            client_eof: false,
+            backend_eof: false,
             pending_ops: 0,
         })
         .collect();
@@ -190,7 +196,9 @@ fn main() -> std::io::Result<()> {
             conn.pending_ops -= 1;
 
             if conn.closing {
-                if conn.pending_ops == 0 {
+                if conn.pending_ops == 0 && conn.active {
+                    unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
+                    conn.active = false;
                     free_indices.push_back(conn_idx);
                 }
                 continue;
@@ -214,6 +222,7 @@ fn main() -> std::io::Result<()> {
                         // Backend connect failed
                         unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
                         conn.closing = true;
+                        conn.active = false;
                         if conn.pending_ops == 0 {
                             free_indices.push_back(conn_idx);
                         }
@@ -228,29 +237,32 @@ fn main() -> std::io::Result<()> {
                                 .user_data(Token::WriteToBackend { conn_idx, n }.to_u64());
                             if sq.push(&w_backend).is_ok() { conn.pending_ops += 1; }
                         }
-                    } else {
-                        // EOF or error from client
-                        unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
-                        conn.closing = true;
-                        if conn.pending_ops == 0 {
-                            free_indices.push_back(conn_idx);
+                    } else if res == 0 {
+                        // Client EOF
+                        conn.client_eof = true;
+                        if !conn.backend_eof {
+                            unsafe { libc::shutdown(conn.backend_fd, libc::SHUT_WR); }
                         }
+                        if conn.backend_eof {
+                            conn.closing = true;
+                        }
+                    } else {
+                        // Error from client
+                        conn.closing = true;
                     }
                 }
                 Token::WriteToBackend { .. } => {
                     if res >= 0 {
-                        unsafe {
-                            let r_client = opcode::Read::new(types::Fd(conn.client_fd), conn.client_buf.as_ptr() as *mut _, BUFFER_SIZE as u32)
-                                .build()
-                                .user_data(Token::ReadFromClient { conn_idx }.to_u64());
-                            if sq.push(&r_client).is_ok() { conn.pending_ops += 1; }
+                        if !conn.client_eof {
+                            unsafe {
+                                let r_client = opcode::Read::new(types::Fd(conn.client_fd), conn.client_buf.as_ptr() as *mut _, BUFFER_SIZE as u32)
+                                    .build()
+                                    .user_data(Token::ReadFromClient { conn_idx }.to_u64());
+                                if sq.push(&r_client).is_ok() { conn.pending_ops += 1; }
+                            }
                         }
                     } else {
-                        unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
                         conn.closing = true;
-                        if conn.pending_ops == 0 {
-                            free_indices.push_back(conn_idx);
-                        }
                     }
                 }
                 Token::ReadFromBackend { .. } => {
@@ -262,32 +274,41 @@ fn main() -> std::io::Result<()> {
                                 .user_data(Token::WriteToClient { conn_idx, n }.to_u64());
                             if sq.push(&w_client).is_ok() { conn.pending_ops += 1; }
                         }
-                    } else {
-                        // EOF or error from backend
-                        unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
-                        conn.closing = true;
-                        if conn.pending_ops == 0 {
-                            free_indices.push_back(conn_idx);
+                    } else if res == 0 {
+                        // Backend EOF
+                        conn.backend_eof = true;
+                        if !conn.client_eof {
+                            unsafe { libc::shutdown(conn.client_fd, libc::SHUT_WR); }
                         }
+                        if conn.client_eof {
+                            conn.closing = true;
+                        }
+                    } else {
+                        // Error from backend
+                        conn.closing = true;
                     }
                 }
                 Token::WriteToClient { .. } => {
                     if res >= 0 {
-                        unsafe {
-                            let r_backend = opcode::Read::new(types::Fd(conn.backend_fd), conn.backend_buf.as_ptr() as *mut _, BUFFER_SIZE as u32)
-                                .build()
-                                .user_data(Token::ReadFromBackend { conn_idx }.to_u64());
-                            if sq.push(&r_backend).is_ok() { conn.pending_ops += 1; }
+                        if !conn.backend_eof {
+                            unsafe {
+                                let r_backend = opcode::Read::new(types::Fd(conn.backend_fd), conn.backend_buf.as_ptr() as *mut _, BUFFER_SIZE as u32)
+                                    .build()
+                                    .user_data(Token::ReadFromBackend { conn_idx }.to_u64());
+                                if sq.push(&r_backend).is_ok() { conn.pending_ops += 1; }
+                            }
                         }
                     } else {
-                        unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
                         conn.closing = true;
-                        if conn.pending_ops == 0 {
-                            free_indices.push_back(conn_idx);
-                        }
                     }
                 }
                 Token::Accept => unreachable!(),
+            }
+
+            if conn.closing && conn.pending_ops == 0 && conn.active {
+                unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
+                conn.active = false;
+                free_indices.push_back(conn_idx);
             }
         }
     }
