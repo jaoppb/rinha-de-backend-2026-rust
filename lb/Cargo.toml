@@ -4,4 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-monoio = { version = "0.2", features = ["sync", "utils"] }
+io-uring = "0.6"
+libc = "0.2"

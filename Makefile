@@ -8,16 +8,16 @@ LB_IMAGE = jaoppb/rinha-2026-lb:latest
 
 # Core build target
 build-images:
-	docker build -t $(API_IMAGE) --build-arg INPUT_FILE=$(INPUT_FILE) --build-arg CARGO_FEATURES=$(CARGO_FEATURES) .
+	docker build -t $(API_IMAGE) --build-arg INPUT_FILE=$(INPUT_FILE) .
 	docker build -t $(LB_IMAGE) lb/
 
-# Default dev build: verbose profile + example data
+# Default dev build: example data
 build:
-	make build-images INPUT_FILE=resources/example-references.json CARGO_FEATURES=verbose
+	make build-images INPUT_FILE=resources/example-references.json
 
-# Release build: no verbose + full data
+# Release build: full data
 build-release:
-	make build-images INPUT_FILE=resources/references.json.gz CARGO_FEATURES=""
+	make build-images INPUT_FILE=resources/references.json.gz
 
 up:
 	$(DOCKER_COMPOSE) up -d
@@ -46,6 +46,7 @@ test-submission:
 
 docker-push: build-release
 	docker push $(API_IMAGE)
+	docker push $(LB_IMAGE)
 
 run-all: restart
 	sleep 5

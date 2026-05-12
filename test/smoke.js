@@ -31,7 +31,7 @@ const payload = {
 
 export const options = {
     vus: 1,
-    iterations: 5,
+    iterations: 10,
     // Teto absoluto por iteração — se o backend começar a responder lento,
     // o k6 aborta em vez de pendurar o job até o timeout do GitHub Actions.
     maxDuration: '60s',

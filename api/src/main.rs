@@ -5,7 +5,6 @@ mod mmap;
 mod vectorizer;
 
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use std::io::Write;
 use std::rc::Rc;
 
 use crate::http_parser::{HttpRoute, parse_http_request};
@@ -14,20 +13,9 @@ use crate::knn::IvfIndex;
 use crate::mmap::{load_dataset, load_ivf_data, load_lookups, Record};
 use crate::vectorizer::vectorize;
 
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        #[cfg(any(debug_assertions, feature = "verbose"))]
-        {
-            println!($($arg)*);
-            let _ = std::io::stdout().flush();
-        }
-    };
-}
-
 type SharedState = Rc<(Rc<IvfIndex>, &'static [Record])>;
 
 fn main() {
-    println!("Starting API with embedded lookups...");
     let lookups = Rc::new(load_lookups());
 
     // Load datasets immediately as they are now static
@@ -54,7 +42,6 @@ fn main() {
             .expect("Failed to set non-blocking");
         let listener = monoio::net::UnixListener::from_std(std_listener)
             .expect("Failed to convert std unix socket to monoio");
-        debug_log!("Ready on unix:{}", sock_path);
 
         loop {
             let (conn, _) = listener.accept().await.unwrap();
@@ -75,7 +62,6 @@ async fn handle_connection<S: Stream>(
     lookups: Rc<crate::mmap::LookupData>,
     state: SharedState,
 ) {
-    debug_log!("New connection received");
     let mut main_buf = Vec::with_capacity(2048);
     let mut read_buf = vec![0u8; 2048];
 
@@ -88,7 +74,6 @@ async fn handle_connection<S: Stream>(
                 main_buf.extend_from_slice(&read_buf[..n]);
             }
             _ => {
-                debug_log!("Connection closed or error");
                 return;
             }
         }
@@ -102,16 +87,20 @@ async fn handle_connection<S: Stream>(
                     break;
                 }
                 HttpRoute::Ready => {
-                    debug_log!("Handling /ready");
                     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
                     let _ = conn.write_all(response).await;
                 }
                 HttpRoute::FraudScore(body) => {
-                    let tx = (!body.is_empty()).then(|| parse_json_payload(body)).flatten();
+                    let tx = (!body.is_empty())
+                        .then(|| parse_json_payload(body))
+                        .flatten();
+
                     match tx.as_ref().map(|t| vectorize(t, &lookups)) {
                         Some(Some(vec)) => {
                             let (index, records) = &*state;
+
                             let (approved, score) = index.search(&vec, records);
+
                             let resp_body =
                                 format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
                             let response = format!(

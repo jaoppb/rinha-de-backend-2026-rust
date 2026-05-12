@@ -2,6 +2,8 @@ FROM rust:1.85-slim AS builder
 
 WORKDIR /app
 
+ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"
+
 # Copy shared resources
 COPY resources ./resources
 
