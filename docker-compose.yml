@@ -1,7 +1,6 @@
 services:
   lb:
     image: jaoppb/rinha-2026-lb:latest
-    build: ./lb
     cap_add:
       - SYS_ADMIN
     security_opt:
@@ -21,7 +20,6 @@ services:
 
   api1: &api
     image: jaoppb/rinha-2026-rust:latest
-    build: .
     volumes:
       - shared-data:/data/shared
     environment:
