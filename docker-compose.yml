@@ -1,6 +1,11 @@
 services:
   lb:
-    image: jaoppb/rinha-2026-lb
+    image: jaoppb/rinha-2026-lb:latest
+    build: ./lb
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
     volumes:
       - shared-data:/data/shared
     ports:
@@ -11,11 +16,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.2'
+          cpus: '0.4'
           memory: '30M'
 
   api1: &api
     image: jaoppb/rinha-2026-rust:latest
+    build: .
     volumes:
       - shared-data:/data/shared
     environment:
@@ -23,7 +29,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.39'
+          cpus: '0.3'
           memory: '40M'
 
   api2:
