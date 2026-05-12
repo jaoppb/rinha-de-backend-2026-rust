@@ -1,315 +1,214 @@
 use io_uring::{opcode, types, IoUring};
-use std::collections::VecDeque;
+use std::ffi::CString;
+use std::mem;
 use std::os::unix::io::RawFd;
 use std::ptr;
 
-const MAX_CONNECTIONS: usize = 512;
-const BUFFER_SIZE: usize = 16384;
-const BACKENDS: [&[u8]; 2] = [b"/data/shared/api1.sock\0", b"/data/shared/api2.sock\0"];
-
-#[derive(Clone, Copy)]
-enum Token {
-    Accept,
-    BackendConnect { conn_idx: usize },
-    ReadFromClient { conn_idx: usize },
-    WriteToBackend { conn_idx: usize, n: usize },
-    ReadFromBackend { conn_idx: usize },
-    WriteToClient { conn_idx: usize, n: usize },
-}
-
-impl Token {
-    fn to_u64(self) -> u64 {
-        match self {
-            Token::Accept => 0,
-            Token::BackendConnect { conn_idx } => (1 << 32) | (conn_idx as u64),
-            Token::ReadFromClient { conn_idx } => (2 << 32) | (conn_idx as u64),
-            Token::WriteToBackend { conn_idx, n } => (3 << 32) | ((n as u64) << 16) | (conn_idx as u64),
-            Token::ReadFromBackend { conn_idx } => (4 << 32) | (conn_idx as u64),
-            Token::WriteToClient { conn_idx, n } => (5 << 32) | ((n as u64) << 16) | (conn_idx as u64),
-        }
-    }
-
-    fn from_u64(val: u64) -> Self {
-        let tag = (val >> 32) as u32;
-        let conn_idx = (val & 0xFFFF) as usize;
-        match tag {
-            0 => Token::Accept,
-            1 => Token::BackendConnect { conn_idx },
-            2 => Token::ReadFromClient { conn_idx },
-            3 => Token::WriteToBackend { conn_idx, n: ((val >> 16) & 0xFFFF) as usize },
-            4 => Token::ReadFromBackend { conn_idx },
-            5 => Token::WriteToClient { conn_idx, n: ((val >> 16) & 0xFFFF) as usize },
-            _ => unreachable!(),
-        }
-    }
-}
-
-struct Connection {
-    client_fd: RawFd,
-    backend_fd: RawFd,
-    client_buf: Box<[u8; BUFFER_SIZE]>,
-    backend_buf: Box<[u8; BUFFER_SIZE]>,
-    backend_addr: Box<libc::sockaddr_un>,
-    active: bool,
-    closing: bool,
-    client_eof: bool,
-    backend_eof: bool,
-    pending_ops: usize,
-}
-
-impl Connection {
-    fn reset(&mut self) {
-        self.client_fd = -1;
-        self.backend_fd = -1;
-        self.active = false;
-        self.closing = false;
-        self.client_eof = false;
-        self.backend_eof = false;
-        self.pending_ops = 0;
-    }
-}
+const CQE_F_MORE: u32 = 1 << 1;
 
 fn main() -> std::io::Result<()> {
-    let mut ring = IoUring::new(1024).map_err(|e| {
-        eprintln!("LB: Failed to initialize io_uring: {}", e);
-        e
-    })?;
-
-    let mut connections: Vec<Connection> = (0..MAX_CONNECTIONS)
-        .map(|_| Connection {
-            client_fd: -1,
-            backend_fd: -1,
-            client_buf: Box::new([0u8; BUFFER_SIZE]),
-            backend_buf: Box::new([0u8; BUFFER_SIZE]),
-            backend_addr: Box::new(unsafe { std::mem::zeroed() }),
-            active: false,
-            closing: false,
-            client_eof: false,
-            backend_eof: false,
-            pending_ops: 0,
-        })
-        .collect();
-    let mut free_indices: VecDeque<usize> = (0..MAX_CONNECTIONS).collect();
-    let mut backend_counter = 0;
-
-    // Create listener
-    let listener_fd = unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        let val: libc::c_int = 1;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &val as *const _ as *const _, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-        
-        let mut addr: libc::sockaddr_in = std::mem::zeroed();
-        addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        addr.sin_port = 9999u16.to_be();
-        addr.sin_addr.s_addr = libc::INADDR_ANY.to_be();
-        
-        if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t) < 0 {
-            let err = std::io::Error::last_os_error();
-            eprintln!("Bind failed: {}", err);
-            panic!("Bind failed");
-        }
-        libc::listen(fd, 1024);
-        fd
-    };
-
-    eprintln!("Raw io_uring LB listening on 0.0.0.0:9999");
-
-    // Initial accept
-    let mut client_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut client_addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    
     unsafe {
-        let accept_e = opcode::Accept::new(types::Fd(listener_fd), &mut client_addr as *mut _ as *mut _, &mut client_addr_len)
-            .build()
-            .user_data(Token::Accept.to_u64());
-        ring.submission().push(&accept_e).expect("queue full");
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
+
+    let upstream_str = std::env::var("UPSTREAMS")
+        .unwrap_or_else(|_| "/data/shared/api1.sock,/data/shared/api2.sock".to_string());
+
+    let upstreams: Vec<String> = upstream_str.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if upstreams.is_empty() {
+        eprintln!("LB Error: No upstreams provided in UPSTREAMS env var");
+        std::process::exit(1);
+    }
+
+    let mut up_addrs = Vec::with_capacity(upstreams.len());
+    for ups in upstreams {
+        let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let c_path = CString::new(ups.as_str()).unwrap();
+        let path_bytes = c_path.as_bytes();
+        let copy_len = path_bytes.len().min(addr.sun_path.len() - 1);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                path_bytes.as_ptr(),
+                addr.sun_path.as_mut_ptr() as *mut u8,
+                copy_len,
+            );
+        }
+        up_addrs.push(addr);
+    }
+
+    let listener_fd = create_listener(9999, 8192)?;
+    let mut ring = IoUring::builder()
+        .setup_single_issuer()
+        .setup_defer_taskrun()
+        .build(4096)?;
+
+    let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+    if uds_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Increase send buffer to handle high connection spikes
+    let sndbuf: libc::c_int = 16 * 1024 * 1024;
+    unsafe {
+        libc::setsockopt(
+            uds_fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sndbuf as *const _ as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
+    eprintln!("Single-threaded io_uring LB listening on 0.0.0.0:9999 handing off to {} upstreams", up_addrs.len());
+
+    push_accept(&mut ring, listener_fd);
+
+    let mut rr = 0;
 
     loop {
         ring.submit_and_wait(1)?;
 
         let mut completions = Vec::new();
         for cqe in ring.completion() {
-            completions.push((cqe.user_data(), cqe.result()));
+            completions.push((cqe.result(), cqe.flags()));
         }
 
-        let mut sq = ring.submission();
-
-        for (user_data, res) in completions {
-            let token = Token::from_u64(user_data);
-
-            if let Token::Accept = token {
-                if res >= 0 {
-                    let client_fd = res;
-                    if let Some(conn_idx) = free_indices.pop_front() {
-                        let conn = &mut connections[conn_idx];
-                        conn.reset();
-                        conn.client_fd = client_fd;
-                        conn.active = true;
-
-                        let backend_path = BACKENDS[backend_counter % BACKENDS.len()];
-                        backend_counter += 1;
-
-                        unsafe {
-                            let b_fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-                            conn.backend_fd = b_fd;
-
-                            conn.backend_addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-                            let path_len = backend_path.len();
-                            let copy_len = path_len.min(108);
-                            ptr::copy_nonoverlapping(backend_path.as_ptr(), conn.backend_addr.sun_path.as_mut_ptr() as *mut u8, copy_len);
-
-                            let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-
-                            let connect_e = opcode::Connect::new(types::Fd(b_fd), &*conn.backend_addr as *const _ as *const _, addr_len)
-                                .build()
-                                .user_data(Token::BackendConnect { conn_idx }.to_u64());
-                            if sq.push(&connect_e).is_ok() {
-                                conn.pending_ops += 1;
-                            }
-                        }
-                    } else {
-                        unsafe { libc::close(client_fd); }
-                    }
-                }
-                // Re-arm accept
-                unsafe {
-                    let accept_e = opcode::Accept::new(types::Fd(listener_fd), &mut client_addr as *mut _ as *mut _, &mut client_addr_len)
-                        .build()
-                        .user_data(Token::Accept.to_u64());
-                    sq.push(&accept_e).ok();
-                }
-                continue;
+        for (res, flags) in completions {
+            if (flags & CQE_F_MORE) == 0 {
+                push_accept(&mut ring, listener_fd);
             }
 
-            // Connection-based tokens
-            let conn_idx = match token {
-                Token::BackendConnect { conn_idx } => conn_idx,
-                Token::ReadFromClient { conn_idx } => conn_idx,
-                Token::WriteToBackend { conn_idx, .. } => conn_idx,
-                Token::ReadFromBackend { conn_idx } => conn_idx,
-                Token::WriteToClient { conn_idx, .. } => conn_idx,
-                _ => unreachable!(),
-            };
+            if res >= 0 {
+                let client_fd = res as RawFd;
+                
+                // Optimize TCP socket
+                set_tcp_nodelay(client_fd);
 
-            let conn = &mut connections[conn_idx];
-            conn.pending_ops -= 1;
+                // Round-robin selection
+                let target_addr = &up_addrs[rr % up_addrs.len()];
+                rr = rr.wrapping_add(1);
 
-            if conn.closing {
-                if conn.pending_ops == 0 && conn.active {
-                    unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
-                    conn.active = false;
-                    free_indices.push_back(conn_idx);
-                }
-                continue;
-            }
+                // Handover FD
+                send_fd(uds_fd, target_addr, client_fd);
 
-            match token {
-                Token::BackendConnect { .. } => {
-                    if res >= 0 {
-                        unsafe {
-                            let r_client = opcode::Read::new(types::Fd(conn.client_fd), conn.client_buf.as_ptr() as *mut _, BUFFER_SIZE as u32)
-                                .build()
-                                .user_data(Token::ReadFromClient { conn_idx }.to_u64());
-                            if sq.push(&r_client).is_ok() { conn.pending_ops += 1; }
-
-                            let r_backend = opcode::Read::new(types::Fd(conn.backend_fd), conn.backend_buf.as_ptr() as *mut _, BUFFER_SIZE as u32)
-                                .build()
-                                .user_data(Token::ReadFromBackend { conn_idx }.to_u64());
-                            if sq.push(&r_backend).is_ok() { conn.pending_ops += 1; }
-                        }
-                    } else {
-                        // Backend connect failed
-                        unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
-                        conn.closing = true;
-                        conn.active = false;
-                        if conn.pending_ops == 0 {
-                            free_indices.push_back(conn_idx);
-                        }
-                    }
-                }
-                Token::ReadFromClient { .. } => {
-                    if res > 0 {
-                        let n = res as usize;
-                        unsafe {
-                            let w_backend = opcode::Write::new(types::Fd(conn.backend_fd), conn.client_buf.as_ptr(), n as u32)
-                                .build()
-                                .user_data(Token::WriteToBackend { conn_idx, n }.to_u64());
-                            if sq.push(&w_backend).is_ok() { conn.pending_ops += 1; }
-                        }
-                    } else if res == 0 {
-                        // Client EOF
-                        conn.client_eof = true;
-                        if !conn.backend_eof {
-                            unsafe { libc::shutdown(conn.backend_fd, libc::SHUT_WR); }
-                        }
-                        if conn.backend_eof {
-                            conn.closing = true;
-                        }
-                    } else {
-                        // Error from client
-                        conn.closing = true;
-                    }
-                }
-                Token::WriteToBackend { .. } => {
-                    if res >= 0 {
-                        if !conn.client_eof {
-                            unsafe {
-                                let r_client = opcode::Read::new(types::Fd(conn.client_fd), conn.client_buf.as_ptr() as *mut _, BUFFER_SIZE as u32)
-                                    .build()
-                                    .user_data(Token::ReadFromClient { conn_idx }.to_u64());
-                                if sq.push(&r_client).is_ok() { conn.pending_ops += 1; }
-                            }
-                        }
-                    } else {
-                        conn.closing = true;
-                    }
-                }
-                Token::ReadFromBackend { .. } => {
-                    if res > 0 {
-                        let n = res as usize;
-                        unsafe {
-                            let w_client = opcode::Write::new(types::Fd(conn.client_fd), conn.backend_buf.as_ptr(), n as u32)
-                                .build()
-                                .user_data(Token::WriteToClient { conn_idx, n }.to_u64());
-                            if sq.push(&w_client).is_ok() { conn.pending_ops += 1; }
-                        }
-                    } else if res == 0 {
-                        // Backend EOF
-                        conn.backend_eof = true;
-                        if !conn.client_eof {
-                            unsafe { libc::shutdown(conn.client_fd, libc::SHUT_WR); }
-                        }
-                        if conn.client_eof {
-                            conn.closing = true;
-                        }
-                    } else {
-                        // Error from backend
-                        conn.closing = true;
-                    }
-                }
-                Token::WriteToClient { .. } => {
-                    if res >= 0 {
-                        if !conn.backend_eof {
-                            unsafe {
-                                let r_backend = opcode::Read::new(types::Fd(conn.backend_fd), conn.backend_buf.as_ptr() as *mut _, BUFFER_SIZE as u32)
-                                    .build()
-                                    .user_data(Token::ReadFromBackend { conn_idx }.to_u64());
-                                if sq.push(&r_backend).is_ok() { conn.pending_ops += 1; }
-                            }
-                        }
-                    } else {
-                        conn.closing = true;
-                    }
-                }
-                Token::Accept => unreachable!(),
-            }
-
-            if conn.closing && conn.pending_ops == 0 && conn.active {
-                unsafe { libc::close(conn.client_fd); libc::close(conn.backend_fd); }
-                conn.active = false;
-                free_indices.push_back(conn_idx);
+                // Local close - API now owns it
+                unsafe { libc::close(client_fd); }
             }
         }
+    }
+}
+
+fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int) {
+    unsafe {
+        let mut msg: libc::msghdr = mem::zeroed();
+        msg.msg_name = addr as *const _ as *mut libc::c_void;
+        msg.msg_namelen = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+
+        let mut iov = libc::iovec {
+            iov_base: "1".as_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+
+        let mut cmsg_buf = [0u8; 24]; // CMSG_SPACE(sizeof(int))
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = 24;
+
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if !cmsg.is_null() {
+            (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<libc::c_int>() as u32) as _;
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
+            *data = fd_to_send;
+            msg.msg_controllen = (*cmsg).cmsg_len;
+        }
+
+        // Fast non-blocking send with minimal retries
+        let mut retries = 0;
+        loop {
+            let res = libc::sendmsg(sock, &msg, 0);
+            if res >= 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                retries += 1;
+                if retries > 50 {
+                    break;
+                }
+                std::thread::yield_now();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn push_accept(ring: &mut IoUring, listen_fd: RawFd) {
+    let sqe = opcode::AcceptMulti::new(types::Fd(listen_fd))
+        .build()
+        .user_data(1);
+    loop {
+        unsafe {
+            if ring.submission().push(&sqe).is_ok() {
+                return;
+            }
+        }
+        let _ = ring.submit();
+    }
+}
+
+fn create_listener(port: u16, backlog: i32) -> std::io::Result<RawFd> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    
+    let one: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
+    }
+
+    let mut addr: libc::sockaddr_in = unsafe { mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = port.to_be();
+    addr.sin_addr.s_addr = libc::INADDR_ANY.to_be();
+    
+    let rc = unsafe {
+        libc::bind(fd, &addr as *const _ as *const libc::sockaddr, mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+    };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd); }
+        return Err(err);
+    }
+    
+    if unsafe { libc::listen(fd, backlog) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd); }
+        return Err(err);
+    }
+    
+    Ok(fd)
+}
+
+fn set_tcp_nodelay(fd: RawFd) {
+    let one: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &one as *const _ as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 }
