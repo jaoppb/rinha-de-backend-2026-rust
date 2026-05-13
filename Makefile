@@ -1,4 +1,4 @@
-.PHONY: build build-release up down restart logs smoke test test-submission docker-push build-images
+.PHONY: build build-release up down restart logs smoke test test-submission docker-push build-images preview
 
 DOCKER_COMPOSE = docker-compose
 K6_IMAGE = grafana/k6
@@ -51,3 +51,6 @@ docker-push: build-release
 run-all: restart
 	sleep 5
 	make smoke
+
+preview:
+	gh issue create --repo zanfranceschi/rinha-de-backend-2026 --title "preview" --body "rinha/test jaoppb-rust"
