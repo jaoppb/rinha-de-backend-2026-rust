@@ -1,6 +1,7 @@
 services:
   lb:
     image: jaoppb/rinha-2026-lb:latest
+    restart: always
     cap_add:
       - SYS_ADMIN
     security_opt:
@@ -9,9 +10,8 @@ services:
       - shared-data:/data/shared
     ports:
       - '9999:9999'
-    depends_on:
-      - api1
-      - api2
+    environment:
+      - UPSTREAMS=/data/shared/api1.sock,/data/shared/api2.sock
     deploy:
       resources:
         limits:
@@ -20,6 +20,11 @@ services:
 
   api1: &api
     image: jaoppb/rinha-2026-rust:latest
+    restart: always
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
     volumes:
       - shared-data:/data/shared
     environment:
