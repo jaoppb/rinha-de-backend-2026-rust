@@ -1,6 +1,6 @@
 use crate::mmap::{Record, IvfData};
 
-const K: usize = 5;
+const K: usize = 7;
 const N_CENTROIDS: usize = 256;
 const N_PROBE: usize = 8; // Number of clusters to search
 
@@ -21,7 +21,7 @@ impl IvfIndex {
         // 1. Find nearest clusters
         let mut cluster_dists = [(0usize, 0.0f32); N_CENTROIDS];
         for (i, centroid) in centroids.iter().enumerate() {
-            cluster_dists[i] = (i, euclidean_distance(query, centroid));
+            cluster_dists[i] = (i, manhattan_distance(query, centroid));
         }
         cluster_dists.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
@@ -35,7 +35,7 @@ impl IvfIndex {
 
             for &idx in &indices[start..end] {
                 let record = &records[idx as usize];
-                let dist = euclidean_distance(query, &record.vector);
+                let dist = manhattan_distance(query, &record.vector);
 
                 // Update top K
                 if dist < top_k[K - 1].0 {
@@ -54,16 +54,16 @@ impl IvfIndex {
         }
 
         let fraud_score = fraud_count as f32 / K as f32;
-        (fraud_score < 0.6, fraud_score)
+        // Sensitivity: 3/7 fraud neighbors (0.428...) will result in rejection.
+        (fraud_score < 0.42, fraud_score)
     }
 }
 
 #[inline(always)]
-fn euclidean_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
+fn manhattan_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
     let mut sum = 0.0;
     for i in 0..14 {
-        let diff = v1[i] - v2[i];
-        sum += diff * diff;
+        sum += (v1[i] - v2[i]).abs();
     }
     sum
 }
