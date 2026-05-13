@@ -77,6 +77,9 @@ pub fn parse_http_request(buf: &[u8]) -> (HttpRoute<'_>, usize) {
     }
 
     let total_len = headers_end + content_length;
+    if total_len > 2048 {
+        return (HttpRoute::NotFound, 0);
+    }
     if buf.len() < total_len {
         return (HttpRoute::Incomplete, 0);
     }

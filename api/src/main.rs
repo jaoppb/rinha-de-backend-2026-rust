@@ -175,6 +175,9 @@ fn main() -> std::io::Result<()> {
 }
 
 fn push_recvmsg(ring: &mut IoUring, fd: RawFd, msg: *mut libc::msghdr) {
+    unsafe {
+        (*msg).msg_controllen = 256;
+    }
     let sqe = opcode::RecvMsg::new(types::Fd(fd), msg)
         .build()
         .user_data(0);

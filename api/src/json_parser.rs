@@ -84,6 +84,7 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
             while i < body.len() && body[i] != b't' && body[i] != b'f' {
                 i += 1;
             }
+            if i >= body.len() { return None; }
             let b = body[i] == b't';
             while i < body.len() && body[i].is_ascii_alphabetic() {
                 i += 1;
@@ -169,6 +170,8 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
         });
     }
 
+    if i >= body.len() { return None; }
+
     skip_to_colon!(); // timestamp
     let last_tx_timestamp = Some(parse_str!());
 
@@ -201,6 +204,10 @@ pub fn parse_timestamp(ts: &[u8]) -> Option<(u8, u8)> {
     let year = std::str::from_utf8(&ts[0..4]).ok()?.parse::<i32>().ok()?;
     let month = std::str::from_utf8(&ts[5..7]).ok()?.parse::<i32>().ok()?;
     let day = std::str::from_utf8(&ts[8..10]).ok()?.parse::<i32>().ok()?;
+
+    if month < 1 || month > 12 {
+        return None;
+    }
 
     let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     let mut y = year;
