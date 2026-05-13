@@ -24,13 +24,6 @@ fn main() -> std::io::Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    let lookups = Rc::new(load_lookups());
-    let dataset = load_dataset().expect("Failed to load dataset");
-    let ivf_data = load_ivf_data().expect("Failed to load IVF data");
-    println!("Successfully loaded all datasets.");
-    let index = Rc::new(IvfIndex::new(ivf_data));
-    let records = dataset.records;
-
     let sock_path = std::env::var("SOCK").expect("SOCK env var must be set");
     let _ = std::fs::remove_file(&sock_path);
     let uds_fd = unsafe {
@@ -58,6 +51,16 @@ fn main() -> std::io::Result<()> {
         .setup_defer_taskrun()
         .build(RING_SIZE)?;
 
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let l = load_lookups();
+        let d = load_dataset().expect("Failed to load dataset");
+        let i = load_ivf_data().expect("Failed to load IVF data");
+        let _ = tx.send((l, d, i));
+    });
+
+    let mut state: Option<(Rc<crate::mmap::LookupData>, crate::mmap::Dataset, Rc<IvfIndex>)> = None;
+
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     let mut iov_base = [0u8; 1];
     let mut iov = libc::iovec {
@@ -78,6 +81,13 @@ fn main() -> std::io::Result<()> {
 
     loop {
         ring.submit_and_wait(1)?;
+
+        if state.is_none() {
+            if let Ok((l, d, i)) = rx.try_recv() {
+                state = Some((Rc::new(l), d, Rc::new(IvfIndex::new(i))));
+                println!("Successfully loaded all datasets.");
+            }
+        }
 
         let mut cqes_data = Vec::with_capacity(64);
         for cqe in ring.completion() {
@@ -114,25 +124,35 @@ fn main() -> std::io::Result<()> {
                             }
                         }
                         HttpRoute::Ready => {
-                            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                            let resp: &[u8] = if state.is_some() {
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                            } else {
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+                            };
                             write_buf[..resp.len()].copy_from_slice(resp);
                             push_write(&mut ring, fd, write_buf.as_ptr(), resp.len());
                         }
                         HttpRoute::FraudScore(body) => {
-                            let tx = (!body.is_empty()).then(|| parse_json_payload(body)).flatten();
-                            let response = match tx.as_ref().map(|t| vectorize(t, &lookups)) {
-                                Some(Some(vec)) => {
-                                    let (approved, score) = index.search(&vec, records);
-                                    let resp_body = format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
-                                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", resp_body.len(), resp_body)
-                                }
-                                Some(None) => "HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string(),
-                                None => "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string(),
-                            };
-                            let b = response.as_bytes();
-                            let len = std::cmp::min(b.len(), BUF_SIZE);
-                            write_buf[..len].copy_from_slice(&b[..len]);
-                            push_write(&mut ring, fd, write_buf.as_ptr(), len);
+                            if let Some((lookups, dataset, index)) = state.as_ref() {
+                                let tx = (!body.is_empty()).then(|| parse_json_payload(body)).flatten();
+                                let response = match tx.as_ref().map(|t| vectorize(t, lookups)) {
+                                    Some(Some(vec)) => {
+                                        let (approved, score) = index.search(&vec, dataset.records);
+                                        let resp_body = format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
+                                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", resp_body.len(), resp_body)
+                                    }
+                                    Some(None) => "HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string(),
+                                    None => "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string(),
+                                };
+                                let b = response.as_bytes();
+                                let len = std::cmp::min(b.len(), BUF_SIZE);
+                                write_buf[..len].copy_from_slice(&b[..len]);
+                                push_write(&mut ring, fd, write_buf.as_ptr(), len);
+                            } else {
+                                let resp: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                                write_buf[..resp.len()].copy_from_slice(resp);
+                                push_write(&mut ring, fd, write_buf.as_ptr(), resp.len());
+                            }
                         }
                         HttpRoute::NotFound => {
                             let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
