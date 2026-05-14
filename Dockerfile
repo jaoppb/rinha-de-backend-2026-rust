@@ -3,6 +3,7 @@ FROM rust:1.85-slim AS builder
 WORKDIR /app
 
 ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"
+ARG FEATURES=
 
 # Copy shared resources
 COPY resources ./resources
@@ -20,7 +21,7 @@ RUN mkdir -p /app/data && \
 # 3. Build API
 COPY api/Cargo.toml api/Cargo.lock api/build.rs ./api/
 COPY api/src ./api/src
-RUN cd api && cargo build --release
+RUN cd api && cargo build --release ${FEATURES}
 
 FROM debian:bookworm-slim
 WORKDIR /app

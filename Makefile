@@ -19,14 +19,18 @@ build:
 build-release:
 	make build-images INPUT_FILE=resources/references.json.gz
 
+# Build images with verbose-logging feature enabled (tags with :verbose)
+build-verbose:
+	docker build -t $(API_IMAGE) --build-arg INPUT_FILE=resources/example-references.json --build-arg FEATURES="--features verbose-logging" .
+	docker build -t $(LB_IMAGE) --build-arg FEATURES="--features verbose-logging" lb/
+
 up:
 	$(DOCKER_COMPOSE) up -d
 
 down:
 	$(DOCKER_COMPOSE) down
 
-restart:
-	make down && make build && make up
+restart: down build up
 
 logs:
 	$(DOCKER_COMPOSE) logs -f
@@ -37,20 +41,13 @@ smoke:
 test:
 	docker run --rm --network host -u root -w /api -v "$(PWD):/api" -i $(K6_IMAGE) run test/test.js
 
-test-submission:
-	make down
-	make build-release
-	make up
-	sleep 10
-	make test
+test-submission: down build-release up test
 
 docker-push: build-release
 	docker push $(API_IMAGE)
 	docker push $(LB_IMAGE)
 
-run-all: restart
-	sleep 5
-	make smoke
+run-all: restart smoke
 
 preview:
 	gh issue create --repo zanfranceschi/rinha-de-backend-2026 --title "preview" --body "rinha/test jaoppb-rust"
