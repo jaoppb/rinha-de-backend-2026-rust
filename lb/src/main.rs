@@ -3,6 +3,9 @@ use std::ffi::CString;
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::ptr;
+mod logging;
+
+use logging::{Level, Category};
 
 const CQE_F_MORE: u32 = 1 << 1;
 
@@ -20,7 +23,7 @@ fn main() -> std::io::Result<()> {
         .collect();
 
     if upstreams.is_empty() {
-        eprintln!("LB Error: No upstreams provided in UPSTREAMS env var");
+        logging::log(Level::Warn, Category::IoUring, "No upstreams provided in UPSTREAMS env var");
         std::process::exit(1);
     }
 
@@ -65,6 +68,7 @@ fn main() -> std::io::Result<()> {
     }
 
     eprintln!("Single-threaded io_uring LB listening on 0.0.0.0:9999 handing off to {} upstreams", up_addrs.len());
+    logging::log(Level::Info, Category::IoUring, &format!("LB started, {} upstreams configured", up_addrs.len()));
 
     push_accept(&mut ring, listener_fd);
 
@@ -85,19 +89,19 @@ fn main() -> std::io::Result<()> {
 
             if res >= 0 {
                 let client_fd = res as RawFd;
+                logging::log(Level::Debug, Category::IoUring, &format!("Client accepted, fd={}", client_fd));
                 
-                // Optimize TCP socket
                 set_tcp_nodelay(client_fd);
 
-                // Round-robin selection
                 let target_addr = &up_addrs[rr % up_addrs.len()];
+                let upstream_idx = rr % up_addrs.len();
                 rr = rr.wrapping_add(1);
 
-                // Handover FD
+                logging::log(Level::Debug, Category::Request, &format!("Handing off fd={} to upstream {}", client_fd, upstream_idx));
                 send_fd(uds_fd, target_addr, client_fd);
 
-                // Local close - API now owns it
                 unsafe { libc::close(client_fd); }
+                logging::log(Level::Debug, Category::IoUring, &format!("Local close after handoff, fd={}", client_fd));
             }
         }
     }
@@ -135,16 +139,19 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
         loop {
             let res = libc::sendmsg(sock, &msg, 0);
             if res >= 0 {
+                logging::log(Level::Debug, Category::Request, &format!("FD handoff successful, fd={}", fd_to_send));
                 break;
             }
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
                 retries += 1;
                 if retries > 50 {
+                    logging::log(Level::Warn, Category::Request, &format!("FD handoff failed after {} retries (WouldBlock), fd={}", retries, fd_to_send));
                     break;
                 }
                 std::thread::yield_now();
             } else {
+                logging::log(Level::Warn, Category::Request, &format!("FD handoff error: {}, fd={}", err, fd_to_send));
                 break;
             }
         }

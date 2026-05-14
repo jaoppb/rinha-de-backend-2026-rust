@@ -3,6 +3,7 @@ mod json_parser;
 mod knn;
 mod mmap;
 mod vectorizer;
+mod logging;
 
 use std::mem;
 use std::os::unix::io::RawFd;
@@ -15,6 +16,7 @@ use crate::json_parser::parse_json_payload;
 use crate::knn::IvfIndex;
 use crate::mmap::{load_dataset, load_ivf_data, load_lookups};
 use crate::vectorizer::vectorize;
+use crate::logging::{Level, Category};
 
 const RING_SIZE: u32 = 4096;
 const BUF_SIZE: usize = 2048;
@@ -86,6 +88,7 @@ fn main() -> std::io::Result<()> {
             if let Ok((l, d, i)) = rx.try_recv() {
                 state = Some((Rc::new(l), d, Rc::new(IvfIndex::new(i))));
                 println!("Successfully loaded all datasets.");
+                logging::log(Level::Info, Category::Request, "Datasets loaded successfully");
             }
         }
 
@@ -112,55 +115,71 @@ fn main() -> std::io::Result<()> {
                 let fd = (user_data >> 1) as RawFd;
                 if res > 0 {
                     current_pos += res as usize;
+                    logging::log(Level::Debug, Category::IoUring, &format!("Read {} bytes, total buffer pos: {}", res, current_pos));
                     let (route, _) = parse_http_request(&read_buf[..current_pos]);
                     match route {
                         HttpRoute::Incomplete => {
+                            logging::log(Level::Debug, Category::Request, "Request incomplete, waiting for more data");
                             if current_pos < BUF_SIZE {
                                 unsafe {
                                     push_read(&mut ring, fd, read_buf.as_mut_ptr().add(current_pos), BUF_SIZE - current_pos);
                                 }
                             } else {
+                                logging::log(Level::Warn, Category::Request, "Buffer full, closing connection");
                                 push_close(&mut ring, fd);
                             }
                         }
                         HttpRoute::Ready => {
+                            logging::log(Level::Info, Category::Request, "Route: Ready");
                             let resp: &[u8] = if state.is_some() {
                                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
                             } else {
+                                logging::log(Level::Warn, Category::Request, "Ready endpoint called but state not ready");
                                 b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
                             };
                             write_buf[..resp.len()].copy_from_slice(resp);
                             push_write(&mut ring, fd, write_buf.as_ptr(), resp.len());
                         }
                         HttpRoute::FraudScore(body) => {
+                            logging::log(Level::Info, Category::Request, &format!("Route: FraudScore, body_size: {}", body.len()));
                             if let Some((lookups, dataset, index)) = state.as_ref() {
                                 let tx = (!body.is_empty()).then(|| parse_json_payload(body)).flatten();
                                 let response = match tx.as_ref().map(|t| vectorize(t, lookups)) {
                                     Some(Some(vec)) => {
                                         let (approved, score) = index.search(&vec, dataset.records);
                                         let resp_body = format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
+                                        logging::log(Level::Debug, Category::Request, &format!("Fraud score response: approved={}, score={:.1}", approved, score));
                                         format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", resp_body.len(), resp_body)
                                     }
-                                    Some(None) => "HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string(),
-                                    None => "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string(),
+                                    Some(None) => {
+                                        logging::log(Level::Debug, Category::Request, "Vectorization failed");
+                                        "HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string()
+                                    }
+                                    None => {
+                                        logging::log(Level::Debug, Category::Request, "JSON parsing failed");
+                                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string()
+                                    }
                                 };
                                 let b = response.as_bytes();
                                 let len = std::cmp::min(b.len(), BUF_SIZE);
                                 write_buf[..len].copy_from_slice(&b[..len]);
                                 push_write(&mut ring, fd, write_buf.as_ptr(), len);
                             } else {
+                                logging::log(Level::Warn, Category::Request, "FraudScore endpoint called but state not ready");
                                 let resp: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
                                 write_buf[..resp.len()].copy_from_slice(resp);
                                 push_write(&mut ring, fd, write_buf.as_ptr(), resp.len());
                             }
                         }
                         HttpRoute::NotFound => {
+                            logging::log(Level::Info, Category::Request, "Route: NotFound (404)");
                             let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
                             write_buf[..resp.len()].copy_from_slice(resp);
                             push_write(&mut ring, fd, write_buf.as_ptr(), resp.len());
                         }
                     }
                 } else {
+                    logging::log(Level::Debug, Category::IoUring, "Read failed or connection closed");
                     push_close(&mut ring, fd);
                 }
             } else if (user_data & 0x2) == 2 { // Write
