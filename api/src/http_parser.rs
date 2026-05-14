@@ -84,10 +84,14 @@ pub fn parse_http_request(buf: &[u8]) -> (HttpRoute<'_>, usize) {
         return (HttpRoute::Incomplete, 0);
     }
 
-    let route = match path.len() {
-        6 if path[1] == b'r' => HttpRoute::Ready,
-        12 if path[1] == b'f' => HttpRoute::FraudScore(&buf[headers_end..total_len]),
-        _ => HttpRoute::NotFound,
+    // Accept exact "/ready" and common variants ("/ready/", "/ready?...") to avoid
+    // false negatives from health probes that append trailing slashes or query params.
+    let route = if path.starts_with(b"/ready") && (path.len() == 6 || path.get(6) == Some(&b'/') || path.get(6) == Some(&b'?')) {
+        HttpRoute::Ready
+    } else if path.starts_with(b"/fraud-score") {
+        HttpRoute::FraudScore(&buf[headers_end..total_len])
+    } else {
+        HttpRoute::NotFound
     };
 
     (route, total_len)
