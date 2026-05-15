@@ -3,8 +3,6 @@ services:
     image: jaoppb/rinha-2026-lb:latest
     build: ./lb
     restart: always
-    cap_add:
-      - SYS_ADMIN
     security_opt:
       - seccomp:unconfined
     volumes:
@@ -23,8 +21,6 @@ services:
     image: jaoppb/rinha-2026-rust:latest
     build: .
     restart: always
-    cap_add:
-      - SYS_ADMIN
     security_opt:
       - seccomp:unconfined
     volumes:
