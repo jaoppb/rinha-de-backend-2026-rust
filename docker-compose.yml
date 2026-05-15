@@ -1,6 +1,7 @@
 services:
   lb:
     image: jaoppb/rinha-2026-lb:latest
+    pull_policy: always
     restart: always
     cap_add:
       - SYS_ADMIN
@@ -20,6 +21,7 @@ services:
 
   api1: &api
     image: jaoppb/rinha-2026-rust:latest
+    pull_policy: always
     restart: always
     cap_add:
       - SYS_ADMIN
