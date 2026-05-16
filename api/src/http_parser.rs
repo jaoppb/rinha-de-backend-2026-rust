@@ -88,7 +88,9 @@ pub fn parse_http_request(buf: &[u8]) -> (HttpRoute<'_>, usize) {
 
     // Accept exact "/ready" and common variants ("/ready/", "/ready?...") to avoid
     // false negatives from health probes that append trailing slashes or query params.
-    let route = if path.starts_with(b"/ready") && (path.len() == 6 || path.get(6) == Some(&b'/') || path.get(6) == Some(&b'?')) {
+    let route = if path.starts_with(b"/ready")
+        && (path.len() == 6 || path.get(6) == Some(&b'/') || path.get(6) == Some(&b'?'))
+    {
         HttpRoute::Ready
     } else if path.starts_with(b"/fraud-score") {
         HttpRoute::FraudScore(&buf[headers_end..total_len])

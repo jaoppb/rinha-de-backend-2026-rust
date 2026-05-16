@@ -84,7 +84,9 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
             while i < body.len() && body[i] != b't' && body[i] != b'f' {
                 i += 1;
             }
-            if i >= body.len() { return None; }
+            if i >= body.len() {
+                return None;
+            }
             let b = body[i] == b't';
             while i < body.len() && body[i].is_ascii_alphabetic() {
                 i += 1;
@@ -170,7 +172,9 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
         });
     }
 
-    if i >= body.len() { return None; }
+    if i >= body.len() {
+        return None;
+    }
 
     skip_to_colon!(); // timestamp
     let last_tx_timestamp = Some(parse_str!());

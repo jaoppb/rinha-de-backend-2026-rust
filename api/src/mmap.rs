@@ -61,10 +61,10 @@ pub fn load_dataset() -> std::io::Result<Dataset> {
 pub fn load_ivf_data() -> std::io::Result<IvfData> {
     let centroids_file = File::open("/app/data/centroids.bin")?;
     let centroids_mmap = unsafe { Mmap::map(&centroids_file)? };
-    
+
     let indices_file = File::open("/app/data/indices.bin")?;
     let indices_mmap = unsafe { Mmap::map(&indices_file)? };
-    
+
     let offsets_file = File::open("/app/data/offsets.bin")?;
     let offsets_mmap = unsafe { Mmap::map(&offsets_file)? };
 
@@ -76,17 +76,11 @@ pub fn load_ivf_data() -> std::io::Result<IvfData> {
     };
 
     let indices = unsafe {
-        std::slice::from_raw_parts(
-            indices_mmap.as_ptr() as *const u32,
-            indices_mmap.len() / 4,
-        )
+        std::slice::from_raw_parts(indices_mmap.as_ptr() as *const u32, indices_mmap.len() / 4)
     };
 
     let offsets = unsafe {
-        std::slice::from_raw_parts(
-            offsets_mmap.as_ptr() as *const u32,
-            offsets_mmap.len() / 4,
-        )
+        std::slice::from_raw_parts(offsets_mmap.as_ptr() as *const u32, offsets_mmap.len() / 4)
     };
 
     Ok(IvfData {
