@@ -11,10 +11,11 @@ services:
       - '9999:9999'
     environment:
       - UPSTREAMS=/data/shared/api1.sock,/data/shared/api2.sock
+      - LOG_TRANSPORT=${LOG_TRANSPORT:-text}
     deploy:
       resources:
         limits:
-          cpus: '0.4'
+          cpus: '0.2'
           memory: '30M'
 
   api1: &api
@@ -27,16 +28,18 @@ services:
       - shared-data:/data/shared
     environment:
       - SOCK=/data/shared/api1.sock
+      - LOG_TRANSPORT=${LOG_TRANSPORT:-text}
     deploy:
       resources:
         limits:
-          cpus: '0.3'
-          memory: '40M'
+          cpus: '0.4'
+          memory: '160M'
 
   api2:
     <<: *api
     environment:
       - SOCK=/data/shared/api2.sock
+      - LOG_TRANSPORT=${LOG_TRANSPORT:-text}
 
 volumes:
   shared-data:

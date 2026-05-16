@@ -101,6 +101,7 @@ fn main() -> std::io::Result<()> {
 
             if res >= 0 {
                 let client_fd = res as RawFd;
+                let accept_to_handoff_timer = logging::timer_start();
                 logging::log(
                     Level::Debug,
                     Category::IoUring,
@@ -119,6 +120,18 @@ fn main() -> std::io::Result<()> {
                     &format!("Handing off fd={} to upstream {}", client_fd, upstream_idx),
                 );
                 let handoff_ok = send_fd(uds_fd, target_addr, client_fd);
+                logging::log_timing(
+                    if handoff_ok { Level::Info } else { Level::Warn },
+                    Category::Request,
+                    "accept_to_handoff",
+                    accept_to_handoff_timer,
+                    format_args!(
+                        "fd={} upstream={} result={}",
+                        client_fd,
+                        upstream_idx,
+                        if handoff_ok { "ok" } else { "fallback_503" }
+                    ),
+                );
                 if !handoff_ok {
                     logging::log(
                         Level::Warn,
@@ -145,6 +158,7 @@ fn main() -> std::io::Result<()> {
 }
 
 fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int) -> bool {
+    let send_fd_timer = logging::timer_start();
     unsafe {
         let mut msg: libc::msghdr = mem::zeroed();
         msg.msg_name = addr as *const _ as *mut libc::c_void;
@@ -175,6 +189,13 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
                 Category::Request,
                 &format!("FD handoff cmsg allocation failed, fd={}", fd_to_send),
             );
+            logging::log_timing(
+                Level::Warn,
+                Category::Request,
+                "send_fd_total",
+                send_fd_timer,
+                format_args!("fd={} retries=0 result=cmsg_allocation_failed", fd_to_send),
+            );
             return false;
         }
 
@@ -187,6 +208,13 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
                     Level::Debug,
                     Category::Request,
                     &format!("FD handoff successful, fd={}", fd_to_send),
+                );
+                logging::log_timing(
+                    Level::Debug,
+                    Category::Request,
+                    "send_fd_total",
+                    send_fd_timer,
+                    format_args!("fd={} retries={} result=ok", fd_to_send, retries),
                 );
                 return true;
             }
@@ -202,6 +230,16 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
                             retries, fd_to_send
                         ),
                     );
+                    logging::log_timing(
+                        Level::Warn,
+                        Category::Request,
+                        "send_fd_total",
+                        send_fd_timer,
+                        format_args!(
+                            "fd={} retries={} result=wouldblock_retries_exceeded",
+                            fd_to_send, retries
+                        ),
+                    );
                     return false;
                 }
                 std::thread::yield_now();
@@ -211,6 +249,16 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
                     Category::Request,
                     &format!("FD handoff error: {}, fd={}", err, fd_to_send),
                 );
+                logging::log_timing(
+                    Level::Warn,
+                    Category::Request,
+                    "send_fd_total",
+                    send_fd_timer,
+                    format_args!(
+                        "fd={} retries={} result=error err={}",
+                        fd_to_send, retries, err
+                    ),
+                );
                 return false;
             }
         }
@@ -218,6 +266,7 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
 }
 
 fn send_service_unavailable(client_fd: RawFd) {
+    let fallback_timer = logging::timer_start();
     const RESPONSE: &[u8] =
         b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -240,6 +289,16 @@ fn send_service_unavailable(client_fd: RawFd) {
                 Category::Request,
                 &format!("503 fallback write returned 0, fd={}", client_fd),
             );
+            logging::log_timing(
+                Level::Warn,
+                Category::Request,
+                "fallback_503_write",
+                fallback_timer,
+                format_args!(
+                    "fd={} bytes_sent={} retries={} result=write_zero",
+                    client_fd, offset, retries
+                ),
+            );
             return;
         }
 
@@ -257,6 +316,16 @@ fn send_service_unavailable(client_fd: RawFd) {
                             client_fd
                         ),
                     );
+                    logging::log_timing(
+                        Level::Warn,
+                        Category::Request,
+                        "fallback_503_write",
+                        fallback_timer,
+                        format_args!(
+                            "fd={} bytes_sent={} retries={} result=wouldblock_retries_exceeded",
+                            client_fd, offset, retries
+                        ),
+                    );
                     return;
                 }
                 std::thread::yield_now();
@@ -267,10 +336,33 @@ fn send_service_unavailable(client_fd: RawFd) {
                     Category::Request,
                     &format!("503 fallback write error: {}, fd={}", err, client_fd),
                 );
+                logging::log_timing(
+                    Level::Warn,
+                    Category::Request,
+                    "fallback_503_write",
+                    fallback_timer,
+                    format_args!(
+                        "fd={} bytes_sent={} retries={} result=error err={}",
+                        client_fd, offset, retries, err
+                    ),
+                );
                 return;
             }
         }
     }
+
+    logging::log_timing(
+        Level::Debug,
+        Category::Request,
+        "fallback_503_write",
+        fallback_timer,
+        format_args!(
+            "fd={} bytes_sent={} retries={} result=ok",
+            client_fd,
+            RESPONSE.len(),
+            retries
+        ),
+    );
 }
 
 fn push_accept(ring: &mut IoUring, listen_fd: RawFd) {

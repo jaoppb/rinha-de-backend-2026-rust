@@ -1,84 +1,95 @@
 #!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-# Configurações de arquivos
-LOG_FILE="resource_usage.log"
+LOG_FILE="monitor_logs.log"
 STATS_FILE="test_stats.log"
+START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TEST_STATUS=0
+
+export LOG_TRANSPORT="${LOG_TRANSPORT:-json}"
 
 echo "🚀 Iniciando stack..."
 docker compose up -d
 
 echo "📊 Monitoramento iniciado em $(date)"
-echo -n "" >"$LOG_FILE"
-
-monitor_containers() {
-	while true; do
-		docker compose stats --no-stream --no-trunc --format "json" >>"$LOG_FILE" 2>/dev/null || true
-		sleep 1
-	done
-}
-
-monitor_containers &
-MONITOR_PID=$!
+: >"$LOG_FILE"
 
 echo "🔥 Iniciando teste de carga (make test)..."
-make test || echo "⚠️ Os testes retornaram erro, mas continuarei para gerar as estatísticas."
-
-echo "🛑 Teste de carga finalizado. Parando monitoramento..."
-kill $MONITOR_PID
-wait $MONITOR_PID 2>/dev/null || true
-
-echo "📈 Gerando estatísticas em $STATS_FILE..."
-echo "--- Estatísticas de Uso de Recursos (Média e Máximo) ---" >"$STATS_FILE"
-
-# Processamento JSON via JQ com formatação final mantida pelo awk
-jq -r -s '
-  # Filtra leituras inválidas ou iniciais (ex: "--")
-  map(select(.CPUPerc != null and .CPUPerc != "--" and .MemPerc != "--")) |
-  # Agrupa os objetos de log pelo nome do container
-  group_by(.Name)[] |
-  {
-    name: .[0].Name,
-    # Remove o caractere "%" e converte para número
-    cpus: map(.CPUPerc | sub("%"; "") | tonumber),
-    mems: map(.MemPerc | sub("%"; "") | tonumber)
-  } |
-  # Extrai os cálculos: nome, media cpu, max cpu, media mem, max mem
-  [
-    .name,
-    (.cpus | add / length),
-    (.cpus | max),
-    (.mems | add / length),
-    (.mems | max)
-  ] | @tsv
-' "$LOG_FILE" | awk -F'\t' '{
-    # Retorna o printf original para manter o espaçamento visual perfeito (ex: %6.2f)
-    printf "Container: %-25s | CPU Avg: %6.2f%% (Max: %6.2f%%) | Mem Avg: %6.2f%% (Max: %6.2f%%)\n", 
-      $1, $2, $3, $4, $5
-}' | sort >>"$STATS_FILE"
-
-echo "--------------------------------------------------------" >>"$STATS_FILE"
-echo "🔍 Diagnósticos de Saúde e Logs:" >>"$STATS_FILE"
-
-EXITED_CONTAINERS=$(docker compose ps -a --format "{{.Name}}: {{.Status}}" | grep -E "Exited|Dead" || true)
-if [ -n "$EXITED_CONTAINERS" ]; then
-	echo "🚨 ATENÇÃO: Containers que finalizaram:" >>"$STATS_FILE"
-	echo "$EXITED_CONTAINERS" >>"$STATS_FILE"
-else
-	echo "✅ Todos os containers permaneceram ativos." >>"$STATS_FILE"
+make test || TEST_STATUS=$?
+if [[ "$TEST_STATUS" -ne 0 ]]; then
+	echo "⚠️ Os testes retornaram erro, mas continuarei para gerar as estatísticas."
 fi
 
-echo "--- Resumo de Erros nos Logs ---" >>"$STATS_FILE"
-docker compose logs --tail 1000 | grep -Ei "error|panic|fatal|out of memory|oom-kill" | grep -v "warmup" | tail -n 10 >>"$STATS_FILE" || true
-echo "--------------------------------------------------------" >>"$STATS_FILE"
+echo "🛑 Teste de carga finalizado. Coletando logs..."
+docker compose logs --no-color --since "$START_TS" lb api1 api2 >"$LOG_FILE" || true
 
-if [ -f "test/results.json" ]; then
-	echo "🏆 Score Final:" >>"$STATS_FILE"
-	grep -E "\"p99\"|\"failure_rate\"|\"final_score\"" test/results.json | sed 's/[",]//g' >>"$STATS_FILE" || true
-	echo "--------------------------------------------------------" >>"$STATS_FILE"
-fi
+python3 - "$LOG_FILE" "$STATS_FILE" <<'PY'
+import json
+import re
+import sys
+
+log_file, stats_file = sys.argv[1], sys.argv[2]
+service_order = ["lb", "api1", "api2"]
+line_re = re.compile(r"^(?P<service>[^|]+?)\s*\|\s*(?P<payload>\{.*\})$")
+samples = {}
+
+with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
+    for raw in fh:
+        raw = raw.rstrip("\n")
+        match = line_re.match(raw)
+        if not match:
+            continue
+        service = match.group("service").strip().split("-", 1)[0]
+        try:
+            payload = json.loads(match.group("payload"))
+        except json.JSONDecodeError:
+            continue
+        if payload.get("event") != "timing":
+            continue
+
+        op = payload.get("op")
+        elapsed = payload.get("elapsed_us")
+        if not op or elapsed is None:
+            continue
+
+        category = payload.get("category", "")
+        key = (service, op)
+        agg = samples.setdefault(
+            key,
+            {"count": 0, "sum": 0.0, "min": None, "max": None, "categories": set()},
+        )
+        value = float(elapsed)
+        agg["count"] += 1
+        agg["sum"] += value
+        agg["categories"].add(category)
+        agg["min"] = value if agg["min"] is None else min(agg["min"], value)
+        agg["max"] = value if agg["max"] is None else max(agg["max"], value)
+
+with open(stats_file, "w", encoding="utf-8") as out:
+    out.write("--- Timing Statistics (elapsed_us) ---\n")
+    if not samples:
+        out.write("No timing log entries found.\n")
+
+    for service in service_order:
+        out.write(f"\nService: {service}\n")
+        service_keys = [key for key in sorted(samples) if key[0] == service]
+        if not service_keys:
+            out.write("  no timing samples found\n")
+            continue
+
+        for _, op in service_keys:
+            agg = samples[(service, op)]
+            avg = agg["sum"] / agg["count"]
+            categories = ",".join(sorted(c for c in agg["categories"] if c)) or "-"
+            out.write(
+                f"  op={op:<24} categories={categories:<12} "
+                f"samples={agg['count']:<4} avg_us={avg:.2f} "
+                f"min_us={agg['min']:.0f} max_us={agg['max']:.0f}\n"
+            )
+PY
 
 cat "$STATS_FILE"
-docker compose down
 echo "✅ Concluído!"
+
+exit "$TEST_STATUS"

@@ -1,4 +1,4 @@
-.PHONY: build build-release up down restart logs smoke test test-submission docker-push build-images preview
+.PHONY: build build-release up down restart logs smoke test test-submission docker-push build-images preview monitor
 
 DOCKER_COMPOSE = docker-compose
 K6_IMAGE = grafana/k6
@@ -24,8 +24,12 @@ build-verbose:
 	docker build -t $(API_IMAGE) --build-arg INPUT_FILE=resources/example-references.json --build-arg FEATURES="--features verbose-logging" .
 	docker build -t $(LB_IMAGE) --build-arg FEATURES="--features verbose-logging" lb/
 
+build-release-verbose:
+	LOG_TRANSPORT=json docker build -t $(API_IMAGE) --build-arg INPUT_FILE=resources/references.json.gz --build-arg FEATURES="--features verbose-logging" .
+	LOG_TRANSPORT=json docker build -t $(LB_IMAGE) --build-arg FEATURES="--features verbose-logging" lb/
+
 up:
-	$(DOCKER_COMPOSE) up -d
+	LOG_TRANSPORT=json $(DOCKER_COMPOSE) up -d
 
 down:
 	$(DOCKER_COMPOSE) down
@@ -51,3 +55,6 @@ run-all: restart smoke
 
 preview:
 	gh issue create --repo zanfranceschi/rinha-de-backend-2026 --title "preview" --body "rinha/test jaoppb-rust"
+
+monitor:
+	LOG_TRANSPORT=json ./scripts/monitor.sh
