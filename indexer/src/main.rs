@@ -19,6 +19,7 @@ pub struct Record {
 }
 
 const N_CENTROIDS: usize = 256;
+const N_ITERATIONS: usize = 5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -72,26 +73,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Build IVF Index
     let mut centroids = [[0.0f32; 14]; N_CENTROIDS];
-    let stride = records.len() / N_CENTROIDS;
+    let stride = (records.len() / N_CENTROIDS).max(1);
     for i in 0..N_CENTROIDS {
-        centroids[i] = records[i * stride].vector;
+        let idx = (i * stride).min(records.len() - 1);
+        centroids[i] = records[idx].vector;
     }
 
     let mut assignments = vec![0u16; records.len()];
-    let mut counts = [0u32; N_CENTROIDS];
+    for _ in 0..N_ITERATIONS {
+        let mut counts = [0u32; N_CENTROIDS];
+        let mut sums = [[0.0f32; 14]; N_CENTROIDS];
 
-    for (i, record) in records.iter().enumerate() {
-        let mut min_dist = f32::MAX;
-        let mut best_c = 0;
-        for (c_idx, centroid) in centroids.iter().enumerate() {
-            let dist = euclidean_distance(&record.vector, centroid);
-            if dist < min_dist {
-                min_dist = dist;
-                best_c = c_idx;
+        for (i, record) in records.iter().enumerate() {
+            let mut min_dist = f32::MAX;
+            let mut best_c = 0usize;
+            for (c_idx, centroid) in centroids.iter().enumerate() {
+                let dist = squared_euclidean_distance(&record.vector, centroid);
+                if dist < min_dist {
+                    min_dist = dist;
+                    best_c = c_idx;
+                }
+            }
+            assignments[i] = best_c as u16;
+            counts[best_c] += 1;
+            for d in 0..14 {
+                sums[best_c][d] += record.vector[d];
             }
         }
-        assignments[i] = best_c as u16;
-        counts[best_c] += 1;
+
+        for i in 0..N_CENTROIDS {
+            if counts[i] > 0 {
+                let inv = 1.0 / counts[i] as f32;
+                for d in 0..14 {
+                    centroids[i][d] = sums[i][d] * inv;
+                }
+            } else {
+                let idx = (i * stride).min(records.len() - 1);
+                centroids[i] = records[idx].vector;
+            }
+        }
+    }
+
+    let mut counts = [0u32; N_CENTROIDS];
+    for &c_idx in &assignments {
+        counts[c_idx as usize] += 1;
     }
 
     let mut offsets = [0u32; N_CENTROIDS + 1];
@@ -129,7 +154,7 @@ fn convert_record(jr: JsonRecord) -> Record {
     }
 }
 
-fn euclidean_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
+fn squared_euclidean_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
     let mut sum = 0.0;
     for i in 0..14 {
         let diff = v1[i] - v2[i];

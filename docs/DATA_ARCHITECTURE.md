@@ -24,6 +24,9 @@ The indexer generates four primary files in `/app/data/`:
 3.  **`indices.bin`**: Mapping of cluster assignments to dataset indices.
 4.  **`offsets.bin`**: Start/end positions for each cluster in the indices array.
 
+The centroids are refined with a few deterministic k-means passes before the final
+cluster assignments are written.
+
 ## Data Loading Strategy
 
 The Rust API uses the `memmap2` crate to map these files from the local container filesystem at startup.
@@ -32,6 +35,15 @@ The Rust API uses the `memmap2` crate to map these files from the local containe
 By using `mmap`, the OS maps the file directly into the process's virtual memory space.
 - **Memory Efficiency**: The 183MB dataset does not consume the API's heap.
 - **Shared Page Cache**: Because multiple API instances share the same underlying Docker layers on the host, the Linux kernel naturally shares the page cache for these files across containers.
+
+## Fraud Scoring
+
+The API evaluates each request by:
+1. Vectorizing the transaction into the same 14-feature space as the dataset.
+2. Ranking IVF centroids with squared Euclidean distance.
+3. Inspecting the nearest 10 clusters and taking a distance-weighted vote from the 7 nearest records.
+
+This keeps the scoring logic aligned with the index builder while making close neighbors count more than distant ones.
 
 ### Health Checks
 The API is considered "ready" only after all four binary files have been successfully mapped and the IVF index is initialized. HAProxy monitors the `/ready` endpoint to ensure traffic is only routed to fully initialized instances.

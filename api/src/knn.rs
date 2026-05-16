@@ -1,8 +1,10 @@
-use crate::mmap::{Record, IvfData};
+use crate::mmap::{IvfData, Record};
 
 const K: usize = 7;
 const N_CENTROIDS: usize = 256;
-const N_PROBE: usize = 8; // Number of clusters to search
+const N_PROBE: usize = 10; // Number of clusters to search
+const SCORE_EPS: f32 = 1e-6;
+const APPROVAL_THRESHOLD: f32 = 0.44;
 
 pub struct IvfIndex {
     data: IvfData,
@@ -21,7 +23,7 @@ impl IvfIndex {
         // 1. Find nearest clusters
         let mut cluster_dists = [(0usize, 0.0f32); N_CENTROIDS];
         for (i, centroid) in centroids.iter().enumerate() {
-            cluster_dists[i] = (i, manhattan_distance(query, centroid));
+            cluster_dists[i] = (i, squared_euclidean_distance(query, centroid));
         }
         cluster_dists.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
@@ -35,7 +37,7 @@ impl IvfIndex {
 
             for &idx in &indices[start..end] {
                 let record = &records[idx as usize];
-                let dist = manhattan_distance(query, &record.vector);
+                let dist = squared_euclidean_distance(query, &record.vector);
 
                 // Update top K
                 if dist < top_k[K - 1].0 {
@@ -45,25 +47,31 @@ impl IvfIndex {
             }
         }
 
-        // 3. Calculate score
-        let mut fraud_count = 0;
-        for i in 0..K {
-            if top_k[i].1 == 1 {
-                fraud_count += 1;
-            }
+        // 3. Calculate score with distance-weighted voting.
+        let mut fraud_weight = 0.0f32;
+        let mut total_weight = 0.0f32;
+        for &(dist, label) in &top_k {
+            let weight = 1.0 / (1.0 + dist.max(0.0) + SCORE_EPS);
+            total_weight += weight;
+            fraud_weight += weight * label as f32;
         }
 
-        let fraud_score = fraud_count as f32 / K as f32;
-        // Sensitivity: 3/7 fraud neighbors (0.428...) will result in rejection.
-        (fraud_score < 0.42, fraud_score)
+        let fraud_score = if total_weight > 0.0 {
+            fraud_weight / total_weight
+        } else {
+            0.0
+        };
+
+        (fraud_score < APPROVAL_THRESHOLD, fraud_score)
     }
 }
 
 #[inline(always)]
-fn manhattan_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
+fn squared_euclidean_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
     let mut sum = 0.0;
     for i in 0..14 {
-        sum += (v1[i] - v2[i]).abs();
+        let diff = v1[i] - v2[i];
+        sum += diff * diff;
     }
     sum
 }
