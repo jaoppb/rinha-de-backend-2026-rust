@@ -19,7 +19,7 @@ use crate::vectorizer::vectorize;
 use crate::logging::{Level, Category};
 
 const RING_SIZE: u32 = 4096;
-const BUF_SIZE: usize = 2048;
+const BUF_SIZE: usize = 16 * 1024;
 
 fn main() -> std::io::Result<()> {
     unsafe {

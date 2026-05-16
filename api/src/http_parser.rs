@@ -1,3 +1,5 @@
+const MAX_REQUEST_SIZE: usize = 16 * 1024;
+
 pub enum HttpRoute<'a> {
     Ready,
     FraudScore(&'a [u8]),
@@ -77,7 +79,7 @@ pub fn parse_http_request(buf: &[u8]) -> (HttpRoute<'_>, usize) {
     }
 
     let total_len = headers_end + content_length;
-    if total_len > 2048 {
+    if total_len > MAX_REQUEST_SIZE {
         return (HttpRoute::NotFound, 0);
     }
     if buf.len() < total_len {
