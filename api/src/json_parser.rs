@@ -35,15 +35,33 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
             while i < body.len() && !body[i].is_ascii_digit() && body[i] != b'-' {
                 i += 1;
             }
-            let start = i;
-            while i < body.len() && (body[i].is_ascii_digit() || body[i] == b'.' || body[i] == b'-')
-            {
+            let mut neg = false;
+            if i < body.len() && body[i] == b'-' {
+                neg = true;
                 i += 1;
             }
-            std::str::from_utf8(&body[start..i])
-                .ok()?
-                .parse::<f32>()
-                .ok()?
+            let mut int_part: u32 = 0;
+            while i < body.len() && body[i].is_ascii_digit() {
+                int_part = int_part * 10 + (body[i] - b'0') as u32;
+                i += 1;
+            }
+            let mut val = int_part as f32;
+            if i < body.len() && body[i] == b'.' {
+                i += 1;
+                let mut frac_part: u32 = 0;
+                let mut divisor: f32 = 1.0;
+                while i < body.len() && body[i].is_ascii_digit() {
+                    frac_part = frac_part * 10 + (body[i] - b'0') as u32;
+                    divisor *= 10.0;
+                    i += 1;
+                }
+                val += (frac_part as f32) / divisor;
+            }
+            if neg {
+                -val
+            } else {
+                val
+            }
         }};
     }
 
@@ -52,14 +70,12 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
             while i < body.len() && !body[i].is_ascii_digit() {
                 i += 1;
             }
-            let start = i;
+            let mut val: u32 = 0;
             while i < body.len() && body[i].is_ascii_digit() {
+                val = val * 10 + (body[i] - b'0') as u32;
                 i += 1;
             }
-            std::str::from_utf8(&body[start..i])
-                .ok()?
-                .parse::<u32>()
-                .ok()?
+            val
         }};
     }
 
@@ -204,10 +220,10 @@ pub fn parse_timestamp(ts: &[u8]) -> Option<(u8, u8)> {
     if ts.len() < 13 {
         return None;
     }
-    let hour = std::str::from_utf8(&ts[11..13]).ok()?.parse::<u8>().ok()?;
-    let year = std::str::from_utf8(&ts[0..4]).ok()?.parse::<i32>().ok()?;
-    let month = std::str::from_utf8(&ts[5..7]).ok()?.parse::<i32>().ok()?;
-    let day = std::str::from_utf8(&ts[8..10]).ok()?.parse::<i32>().ok()?;
+    let hour = (ts[11] - b'0') * 10 + (ts[12] - b'0');
+    let year = ((ts[0] - b'0') as i32) * 1000 + ((ts[1] - b'0') as i32) * 100 + ((ts[2] - b'0') as i32) * 10 + ((ts[3] - b'0') as i32);
+    let month = ((ts[5] - b'0') as i32) * 10 + ((ts[6] - b'0') as i32);
+    let day = ((ts[8] - b'0') as i32) * 10 + ((ts[9] - b'0') as i32);
 
     if month < 1 || month > 12 {
         return None;
@@ -232,11 +248,11 @@ pub fn parse_minutes_diff(ts1: &[u8], ts2: &[u8]) -> Option<f32> {
         if ts.len() < 16 {
             return None;
         }
-        let year = std::str::from_utf8(&ts[0..4]).ok()?.parse::<i64>().ok()?;
-        let month = std::str::from_utf8(&ts[5..7]).ok()?.parse::<i64>().ok()?;
-        let day = std::str::from_utf8(&ts[8..10]).ok()?.parse::<i64>().ok()?;
-        let hour = std::str::from_utf8(&ts[11..13]).ok()?.parse::<i64>().ok()?;
-        let min = std::str::from_utf8(&ts[14..16]).ok()?.parse::<i64>().ok()?;
+        let year = ((ts[0] - b'0') as i64) * 1000 + ((ts[1] - b'0') as i64) * 100 + ((ts[2] - b'0') as i64) * 10 + ((ts[3] - b'0') as i64);
+        let month = ((ts[5] - b'0') as i64) * 10 + ((ts[6] - b'0') as i64);
+        let day = ((ts[8] - b'0') as i64) * 10 + ((ts[9] - b'0') as i64);
+        let hour = ((ts[11] - b'0') as i64) * 10 + ((ts[12] - b'0') as i64);
+        let min = ((ts[14] - b'0') as i64) * 10 + ((ts[15] - b'0') as i64);
 
         let mut total_days = (year - 2000) * 365 + (year - 2000) / 4;
         let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];

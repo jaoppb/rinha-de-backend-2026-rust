@@ -68,12 +68,12 @@ pub fn parse_http_request(buf: &[u8]) -> (HttpRoute<'_>, usize) {
         {
             let start = j + 16;
             let mut end = start;
+            let mut val: usize = 0;
             while end < headers.len() && headers[end] >= b'0' && headers[end] <= b'9' {
+                val = val * 10 + (headers[end] - b'0') as usize;
                 end += 1;
             }
-            if let Ok(s) = std::str::from_utf8(&headers[start..end]) {
-                content_length = s.parse().unwrap_or(0);
-            }
+            content_length = val;
             break;
         }
     }

@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut min_dist = f32::MAX;
             let mut best_c = 0usize;
             for (c_idx, centroid) in centroids.iter().enumerate() {
-                let dist = squared_euclidean_distance(&record.vector, centroid);
+                let dist = manhattan_distance(&record.vector, centroid);
                 if dist < min_dist {
                     min_dist = dist;
                     best_c = c_idx;
@@ -154,11 +154,10 @@ fn convert_record(jr: JsonRecord) -> Record {
     }
 }
 
-fn squared_euclidean_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
+fn manhattan_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
     let mut sum = 0.0;
     for i in 0..14 {
-        let diff = v1[i] - v2[i];
-        sum += diff * diff;
+        sum += (v1[i] - v2[i]).abs();
     }
     sum
 }

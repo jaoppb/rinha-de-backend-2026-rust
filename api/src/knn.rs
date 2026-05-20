@@ -23,7 +23,7 @@ impl IvfIndex {
         // 1. Find nearest clusters
         let mut cluster_dists = [(0usize, 0.0f32); N_CENTROIDS];
         for (i, centroid) in centroids.iter().enumerate() {
-            cluster_dists[i] = (i, squared_euclidean_distance(query, centroid));
+            cluster_dists[i] = (i, manhattan_distance(query, centroid));
         }
         cluster_dists.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
@@ -37,7 +37,7 @@ impl IvfIndex {
 
             for &idx in &indices[start..end] {
                 let record = &records[idx as usize];
-                let dist = squared_euclidean_distance(query, &record.vector);
+                let dist = manhattan_distance(query, &record.vector);
 
                 // Update top K
                 if dist < top_k[K - 1].0 {
@@ -67,11 +67,10 @@ impl IvfIndex {
 }
 
 #[inline(always)]
-fn squared_euclidean_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
+fn manhattan_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
     let mut sum = 0.0;
     for i in 0..14 {
-        let diff = v1[i] - v2[i];
-        sum += diff * diff;
+        sum += (v1[i] - v2[i]).abs();
     }
     sum
 }
