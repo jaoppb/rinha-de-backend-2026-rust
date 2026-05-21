@@ -3,8 +3,6 @@ services:
     image: jaoppb/rinha-2026-lb:latest
     pull_policy: always
     restart: always
-    security_opt:
-      - seccomp:unconfined
     volumes:
       - shared-data:/data/shared
     ports:
@@ -21,8 +19,6 @@ services:
     image: jaoppb/rinha-2026-rust:latest
     pull_policy: always
     restart: always
-    security_opt:
-      - seccomp:unconfined
     volumes:
       - shared-data:/data/shared
     environment:
