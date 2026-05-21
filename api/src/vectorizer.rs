@@ -54,8 +54,8 @@ pub fn vectorize(tx: &ParsedTransaction, lookups: &LookupData) -> Option<[f32; 1
 
     // 11. unknown_merchant
     let mut is_known = false;
-    for &known in &tx.customer_known_merchants {
-        if known == tx.merchant_id {
+    for idx in 0..tx.customer_known_merchants_len {
+        if tx.customer_known_merchants[idx] == tx.merchant_id {
             is_known = true;
             break;
         }

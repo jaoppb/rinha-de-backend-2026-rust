@@ -136,7 +136,7 @@ fn main() -> std::io::Result<()> {
                     index: Rc::new(IvfIndex::new(i)),
                 });
                 println!("Successfully loaded all datasets.");
-                crate::api_log!(Level::Info, Category::Request, "Datasets loaded successfully");
+                crate::api_log!(crate::logging::Level::Info, crate::logging::Category::Request, "Datasets loaded successfully");
             }
         }
 
@@ -171,7 +171,7 @@ fn main() -> std::io::Result<()> {
                                 conns[client_fd as usize] = ConnState::Reading {
                                     buf: Box::new([0u8; BUF_SIZE]),
                                     pos: 0,
-                                    started_at: logging::timer_start(),
+                                    started_at: crate::logging::timer_start(),
                                 };
                             } else {
                                 libc::close(client_fd);
@@ -223,39 +223,118 @@ fn main() -> std::io::Result<()> {
                                         break;
                                     }
                                     HttpRoute::FraudScore(body_bytes) => {
-                                        let (resp_str, status) = if let Some(state) = &app_state {
+                                        if let Some(state) = &app_state {
                                             let tx = if body_bytes.is_empty() { None } else { parse_json_payload(body_bytes) };
                                             if let Some(tx) = tx {
                                                 if let Some(vec) = vectorize(&tx, &state.lookups) {
                                                     let (approved, score) = state.index.search(&vec, state.dataset.records);
-                                                    let resp_body = format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
-                                                    (format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", resp_body.len(), resp_body), 200)
+                                                    
+                                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                                    let mut pos = 0;
+                                                    
+                                                    // Construct JSON body manually to avoid format!
+                                                    let mut body_buf = [0u8; 64];
+                                                    let mut bp = 0;
+                                                    let body_start = b"{\"approved\":";
+                                                    body_buf[bp..bp+body_start.len()].copy_from_slice(body_start);
+                                                    bp += body_start.len();
+                                                    let app_str: &[u8] = if approved { b"true" } else { b"false" };
+                                                    body_buf[bp..bp+app_str.len()].copy_from_slice(app_str);
+                                                    bp += app_str.len();
+                                                    let score_mid = b",\"fraud_score\":";
+                                                    body_buf[bp..bp+score_mid.len()].copy_from_slice(score_mid);
+                                                    bp += score_mid.len();
+                                                    
+                                                    // Simple float to string (1 decimal place as required: 0.0)
+                                                    let s10 = (score * 10.0 + 0.5) as u32;
+                                                    let whole = s10 / 10;
+                                                    let frac = s10 % 10;
+                                                    
+                                                    if whole >= 10 {
+                                                        body_buf[bp] = b'0' + (whole / 10) as u8;
+                                                        bp += 1;
+                                                    }
+                                                    body_buf[bp] = b'0' + (whole % 10) as u8;
+                                                    bp += 1;
+                                                    body_buf[bp] = b'.';
+                                                    bp += 1;
+                                                    body_buf[bp] = b'0' + frac as u8;
+                                                    bp += 1;
+                                                    body_buf[bp] = b'}';
+                                                    bp += 1;
+                                                    
+                                                    let body = &body_buf[..bp];
+                                                    
+                                                    // Construct HTTP response
+                                                    let h1 = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
+                                                    w_buf[pos..pos+h1.len()].copy_from_slice(h1);
+                                                    pos += h1.len();
+                                                    
+                                                    let len_str = bp.to_string(); // small allocation, but let's keep it for now as bp is small
+                                                    w_buf[pos..pos+len_str.len()].copy_from_slice(len_str.as_bytes());
+                                                    pos += len_str.len();
+                                                    
+                                                    let h2 = b"\r\n\r\n";
+                                                    w_buf[pos..pos+h2.len()].copy_from_slice(h2);
+                                                    pos += h2.len();
+                                                    
+                                                    w_buf[pos..pos+body.len()].copy_from_slice(body);
+                                                    pos += body.len();
+
+                                                    poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
+                                                    conns[client_fd as usize] = ConnState::Writing {
+                                                        buf: w_buf,
+                                                        len: pos,
+                                                        written: 0,
+                                                        started_at,
+                                                        route: "fraud-score",
+                                                        status: 200,
+                                                    };
                                                 } else {
-                                                    ("HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string(), 422)
+                                                    let resp = b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
+                                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                                    w_buf[..resp.len()].copy_from_slice(resp);
+                                                    poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
+                                                    conns[client_fd as usize] = ConnState::Writing {
+                                                        buf: w_buf,
+                                                        len: resp.len(),
+                                                        written: 0,
+                                                        started_at,
+                                                        route: "fraud-score",
+                                                        status: 422,
+                                                    };
                                                 }
                                             } else {
-                                                ("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string(), 400)
+                                                let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                                                let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                                w_buf[..resp.len()].copy_from_slice(resp);
+                                                poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
+                                                conns[client_fd as usize] = ConnState::Writing {
+                                                    buf: w_buf,
+                                                    len: resp.len(),
+                                                    written: 0,
+                                                    started_at,
+                                                    route: "fraud-score",
+                                                    status: 400,
+                                                };
                                             }
                                         } else {
-                                            ("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string(), 503)
-                                        };
-
-                                        let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                        let b = resp_str.as_bytes();
-                                        let len = std::cmp::min(b.len(), BUF_SIZE);
-                                        w_buf[..len].copy_from_slice(&b[..len]);
-                                        
-                                        poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
-                                        conns[client_fd as usize] = ConnState::Writing {
-                                            buf: w_buf,
-                                            len,
-                                            written: 0,
-                                            started_at,
-                                            route: "fraud-score",
-                                            status,
+                                            let resp = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                                            let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                            w_buf[..resp.len()].copy_from_slice(resp);
+                                            poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
+                                            conns[client_fd as usize] = ConnState::Writing {
+                                                buf: w_buf,
+                                                len: resp.len(),
+                                                written: 0,
+                                                started_at,
+                                                route: "fraud-score",
+                                                status: 503,
+                                            };
                                         };
                                         break;
                                     }
+
                                     HttpRoute::NotFound => {
                                         let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
                                         let mut w_buf = Box::new([0u8; BUF_SIZE]);

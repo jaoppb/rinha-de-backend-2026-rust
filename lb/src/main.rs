@@ -60,7 +60,7 @@ fn main() -> std::io::Result<()> {
         Interest::READABLE,
     )?;
 
-    let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+    let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
     if uds_fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -149,7 +149,6 @@ fn main() -> std::io::Result<()> {
 }
 
 fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int) -> bool {
-    let send_fd_timer = logging::timer_start();
     unsafe {
         let mut msg: libc::msghdr = mem::zeroed();
         msg.msg_name = addr as *const _ as *mut libc::c_void;
@@ -175,31 +174,11 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
             *data = fd_to_send;
             msg.msg_controllen = (*cmsg).cmsg_len;
         } else {
-            logging::log(
-                Level::Warn,
-                Category::Request,
-                &format!("FD handoff cmsg allocation failed, fd={}", fd_to_send),
-            );
             return false;
         }
 
-        let mut retries = 0;
-        loop {
-            let res = libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL);
-            if res >= 0 {
-                return true;
-            }
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                retries += 1;
-                if retries > 50 {
-                    return false;
-                }
-                std::thread::yield_now();
-            } else {
-                return false;
-            }
-        }
+        let res = libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL);
+        res >= 0
     }
 }
 
@@ -207,37 +186,8 @@ fn send_service_unavailable(client_fd: RawFd) {
     const RESPONSE: &[u8] =
         b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-    let mut offset = 0usize;
-    let mut retries = 0usize;
-
-    while offset < RESPONSE.len() {
-        let ptr = unsafe { RESPONSE.as_ptr().add(offset) } as *const libc::c_void;
-        let len = RESPONSE.len() - offset;
-        let written = unsafe { libc::send(client_fd, ptr, len, libc::MSG_NOSIGNAL) };
-
-        if written > 0 {
-            offset += written as usize;
-            continue;
-        }
-
-        if written == 0 {
-            return;
-        }
-
-        let err = std::io::Error::last_os_error();
-        match err.kind() {
-            std::io::ErrorKind::Interrupted => continue,
-            std::io::ErrorKind::WouldBlock => {
-                retries += 1;
-                if retries > 10 {
-                    return;
-                }
-                std::thread::yield_now();
-            }
-            _ => {
-                return;
-            }
-        }
+    unsafe {
+        libc::send(client_fd, RESPONSE.as_ptr() as *const libc::c_void, RESPONSE.len(), libc::MSG_NOSIGNAL);
     }
 }
 

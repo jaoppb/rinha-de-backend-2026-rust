@@ -6,7 +6,8 @@ pub struct ParsedTransaction<'a> {
     pub requested_at: &'a [u8],
     pub customer_avg_amount: f32,
     pub customer_tx_count_24h: u32,
-    pub customer_known_merchants: Vec<&'a [u8]>,
+    pub customer_known_merchants: [&'a [u8]; 10],
+    pub customer_known_merchants_len: usize,
     pub merchant_id: &'a [u8],
     pub merchant_mcc: u16,
     pub merchant_avg_amount: f32,
@@ -23,7 +24,8 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
     let mut requested_at = &b""[..];
     let mut customer_avg_amount = 0.0;
     let mut customer_tx_count_24h = 0;
-    let mut customer_known_merchants = Vec::with_capacity(8);
+    let mut customer_known_merchants = [&b""[..]; 10];
+    let mut customer_known_merchants_len = 0;
     let mut merchant_id = &b""[..];
     let mut merchant_mcc = 0;
     let mut merchant_avg_amount = 0.0;
@@ -60,7 +62,10 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
                         b"known_merchants" => {
                             skip_to(body, &mut i, b'[')?;
                             while let Some(s) = next_str_in_array(body, &mut i) {
-                                customer_known_merchants.push(s);
+                                if customer_known_merchants_len < 10 {
+                                    customer_known_merchants[customer_known_merchants_len] = s;
+                                    customer_known_merchants_len += 1;
+                                }
                             }
                         }
                         _ => skip_value(body, &mut i),
@@ -117,6 +122,7 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
         customer_avg_amount,
         customer_tx_count_24h,
         customer_known_merchants,
+        customer_known_merchants_len,
         merchant_id,
         merchant_mcc,
         merchant_avg_amount,
