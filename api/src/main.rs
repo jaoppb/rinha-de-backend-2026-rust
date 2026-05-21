@@ -5,7 +5,8 @@ mod logging;
 mod mmap;
 mod vectorizer;
 
-use io_uring::{IoUring, opcode, types};
+use mio::{Events, Interest, Poll, Token};
+use mio::unix::SourceFd;
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::ptr;
@@ -18,9 +19,9 @@ use crate::logging::{Category, Level, Timer};
 use crate::mmap::{load_dataset, load_ivf_data, load_lookups};
 use crate::vectorizer::vectorize;
 
-const RING_SIZE: u32 = 4096;
 const BUF_SIZE: usize = 16 * 1024;
 const MAX_FDS: usize = 1024;
+const UDS_TOKEN: Token = Token(2048);
 
 enum ConnState {
     Idle,
@@ -37,7 +38,6 @@ enum ConnState {
         route: &'static str,
         status: u16,
     },
-    Closing,
 }
 
 struct AppState {
@@ -86,14 +86,21 @@ fn main() -> std::io::Result<()> {
             &rcvbuf as *const _ as *const libc::c_void,
             mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
+        
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
 
         fd
     };
 
-    let mut ring = IoUring::builder()
-        .setup_single_issuer()
-        .setup_defer_taskrun()
-        .build(RING_SIZE)?;
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(1024);
+
+    poll.registry().register(
+        &mut SourceFd(&uds_fd),
+        UDS_TOKEN,
+        Interest::READABLE,
+    )?;
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -118,11 +125,8 @@ fn main() -> std::io::Result<()> {
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = cmsg_buf.len() as _;
 
-    // Initial RecvMsg to start accepting FDs
-    push_recvmsg(&mut ring, uds_fd, &mut msg);
-
     loop {
-        ring.submit_and_wait(1)?;
+        poll.poll(&mut events, None)?;
 
         if app_state.is_none() {
             if let Ok((l, d, i)) = rx.try_recv() {
@@ -132,228 +136,193 @@ fn main() -> std::io::Result<()> {
                     index: Rc::new(IvfIndex::new(i)),
                 });
                 println!("Successfully loaded all datasets.");
-                api_log!(Level::Info, Category::Request, "Datasets loaded successfully");
+                crate::api_log!(Level::Info, Category::Request, "Datasets loaded successfully");
             }
         }
 
-        let mut cqes_data = Vec::with_capacity(64);
-        for cqe in ring.completion() {
-            cqes_data.push((cqe.result(), cqe.user_data()));
-        }
+        for event in events.iter() {
+            let token = event.token();
 
-        for (res, user_data) in cqes_data {
-            let op = user_data & 0xF;
-            let fd = (user_data >> 4) as RawFd;
+            if token == UDS_TOKEN {
+                loop {
+                    unsafe {
+                        msg.msg_controllen = cmsg_buf.len() as _;
+                        let res = libc::recvmsg(uds_fd, &mut msg, 0);
+                        if res < 0 {
+                            break;
+                        }
 
-            match op {
-                0 => { // RecvMsg (New FD)
-                    if res >= 0 {
-                        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+                        let cmsg = libc::CMSG_FIRSTHDR(&msg);
                         if !cmsg.is_null()
-                            && unsafe {
-                                (*cmsg).cmsg_level == libc::SOL_SOCKET
-                                    && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-                            }
+                            && (*cmsg).cmsg_level == libc::SOL_SOCKET
+                            && (*cmsg).cmsg_type == libc::SCM_RIGHTS
                         {
-                            let client_fd = unsafe { *(libc::CMSG_DATA(cmsg) as *mut libc::c_int) };
+                            let client_fd = *(libc::CMSG_DATA(cmsg) as *mut libc::c_int);
                             if (client_fd as usize) < MAX_FDS {
-                                let mut buf = Box::new([0u8; BUF_SIZE]);
-                                let started_at = logging::timer_start();
-                                push_read(&mut ring, client_fd, buf.as_mut_ptr(), BUF_SIZE);
+                                let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
+                                libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
+                                poll.registry().register(
+                                    &mut SourceFd(&client_fd),
+                                    Token(client_fd as usize),
+                                    Interest::READABLE,
+                                ).ok();
+
                                 conns[client_fd as usize] = ConnState::Reading {
-                                    buf,
+                                    buf: Box::new([0u8; BUF_SIZE]),
                                     pos: 0,
-                                    started_at,
+                                    started_at: logging::timer_start(),
                                 };
                             } else {
-                                api_log!(Level::Warn, Category::Request, "FD {} exceeds MAX_FDS", client_fd);
-                                unsafe { libc::close(client_fd); }
+                                libc::close(client_fd);
                             }
                         }
                     }
-                    // Always repush RecvMsg to keep accepting
-                    push_recvmsg(&mut ring, uds_fd, &mut msg);
                 }
-                1 => { // Read
-                    if res > 0 {
-                        let client_fd = fd;
-                        if let ConnState::Reading { mut buf, mut pos, started_at } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
-                            pos += res as usize;
-                            let (route, _) = parse_http_request(&buf[..pos]);
-                            
-                            match route {
-                                HttpRoute::Incomplete => {
-                                    if pos < BUF_SIZE {
-                                        push_read_at(&mut ring, client_fd, buf.as_mut_ptr(), BUF_SIZE, pos);
-                                        conns[client_fd as usize] = ConnState::Reading { buf, pos, started_at };
-                                    } else {
-                                        api_log!(Level::Warn, Category::Request, "Buffer full for fd {}", client_fd);
-                                        push_close(&mut ring, client_fd);
-                                        conns[client_fd as usize] = ConnState::Closing;
+            } else {
+                let client_fd = token.0 as RawFd;
+                
+                if event.is_readable() {
+                    let mut should_close = false;
+                    if let ConnState::Reading { mut buf, mut pos, started_at } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
+                        loop {
+                            let res = unsafe {
+                                libc::read(client_fd, buf.as_mut_ptr().add(pos) as *mut libc::c_void, BUF_SIZE - pos)
+                            };
+
+                            if res > 0 {
+                                pos += res as usize;
+                                let (route, _) = parse_http_request(&buf[..pos]);
+                                match route {
+                                    HttpRoute::Incomplete => {
+                                        if pos == BUF_SIZE {
+                                            should_close = true;
+                                            break;
+                                        }
+                                        continue;
                                     }
-                                }
-                                HttpRoute::Ready => {
-                                    let is_ready = app_state.is_some();
-                                    let resp: &[u8] = if is_ready {
-                                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-                                    } else {
-                                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
-                                    };
-                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                    w_buf[..resp.len()].copy_from_slice(resp);
-                                    push_write(&mut ring, client_fd, w_buf.as_ptr(), resp.len());
-                                    conns[client_fd as usize] = ConnState::Writing {
-                                        buf: w_buf,
-                                        len: resp.len(),
-                                        written: 0,
-                                        started_at,
-                                        route: "ready",
-                                        status: if is_ready { 200 } else { 503 },
-                                    };
-                                }
-                                HttpRoute::FraudScore(body_bytes) => {
-                                    let (resp_str, status) = if let Some(state) = &app_state {
-                                        let tx = if body_bytes.is_empty() { None } else { parse_json_payload(body_bytes) };
-                                        if let Some(tx) = tx {
-                                            if let Some(vec) = vectorize(&tx, &state.lookups) {
-                                                let (approved, score) = state.index.search(&vec, state.dataset.records);
-                                                let resp_body = format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
-                                                (format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", resp_body.len(), resp_body), 200)
+                                    HttpRoute::Ready => {
+                                        let is_ready = app_state.is_some();
+                                        let resp: &[u8] = if is_ready {
+                                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                                        } else {
+                                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+                                        };
+                                        let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                        w_buf[..resp.len()].copy_from_slice(resp);
+                                        
+                                        poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
+                                        conns[client_fd as usize] = ConnState::Writing {
+                                            buf: w_buf,
+                                            len: resp.len(),
+                                            written: 0,
+                                            started_at,
+                                            route: "ready",
+                                            status: if is_ready { 200 } else { 503 },
+                                        };
+                                        break;
+                                    }
+                                    HttpRoute::FraudScore(body_bytes) => {
+                                        let (resp_str, status) = if let Some(state) = &app_state {
+                                            let tx = if body_bytes.is_empty() { None } else { parse_json_payload(body_bytes) };
+                                            if let Some(tx) = tx {
+                                                if let Some(vec) = vectorize(&tx, &state.lookups) {
+                                                    let (approved, score) = state.index.search(&vec, state.dataset.records);
+                                                    let resp_body = format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
+                                                    (format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", resp_body.len(), resp_body), 200)
+                                                } else {
+                                                    ("HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string(), 422)
+                                                }
                                             } else {
-                                                ("HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string(), 422)
+                                                ("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string(), 400)
                                             }
                                         } else {
-                                            ("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string(), 400)
-                                        }
-                                    } else {
-                                        ("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string(), 503)
-                                    };
-                                    
-                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                    let b = resp_str.as_bytes();
-                                    let len = std::cmp::min(b.len(), BUF_SIZE);
-                                    w_buf[..len].copy_from_slice(&b[..len]);
-                                    push_write(&mut ring, client_fd, w_buf.as_ptr(), len);
-                                    conns[client_fd as usize] = ConnState::Writing {
-                                        buf: w_buf,
-                                        len,
-                                        written: 0,
-                                        started_at,
-                                        route: "fraud-score",
-                                        status,
-                                    };
+                                            ("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string(), 503)
+                                        };
+
+                                        let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                        let b = resp_str.as_bytes();
+                                        let len = std::cmp::min(b.len(), BUF_SIZE);
+                                        w_buf[..len].copy_from_slice(&b[..len]);
+                                        
+                                        poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
+                                        conns[client_fd as usize] = ConnState::Writing {
+                                            buf: w_buf,
+                                            len,
+                                            written: 0,
+                                            started_at,
+                                            route: "fraud-score",
+                                            status,
+                                        };
+                                        break;
+                                    }
+                                    HttpRoute::NotFound => {
+                                        let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                                        let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                        w_buf[..resp.len()].copy_from_slice(resp);
+                                        poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
+                                        conns[client_fd as usize] = ConnState::Writing {
+                                            buf: w_buf,
+                                            len: resp.len(),
+                                            written: 0,
+                                            started_at,
+                                            route: "not-found",
+                                            status: 404,
+                                        };
+                                        break;
+                                    }
                                 }
-                                HttpRoute::NotFound => {
-                                    let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                    w_buf[..resp.len()].copy_from_slice(resp);
-                                    push_write(&mut ring, client_fd, w_buf.as_ptr(), resp.len());
-                                    conns[client_fd as usize] = ConnState::Writing {
-                                        buf: w_buf,
-                                        len: resp.len(),
-                                        written: 0,
-                                        started_at,
-                                        route: "not-found",
-                                        status: 404,
-                                    };
-                                }
-                            }
-                        }
-                    } else {
-                        // Read failed or EOF
-                        if (fd as usize) < MAX_FDS {
-                            if let ConnState::Reading { started_at, .. } = mem::replace(&mut conns[fd as usize], ConnState::Idle) {
-                                api_log_timing!(Level::Warn, Category::Request, "request_lifecycle", started_at, "fd={} route=read-failed status=closed", fd);
-                            }
-                        }
-                        push_close(&mut ring, fd);
-                        conns[fd as usize] = ConnState::Closing;
-                    }
-                }
-                2 => { // Write
-                    if res > 0 {
-                        if (fd as usize) < MAX_FDS {
-                            if let ConnState::Writing { buf, len, mut written, started_at, route, status } = mem::replace(&mut conns[fd as usize], ConnState::Idle) {
-                                written += res as usize;
-                                if written < len {
-                                    push_write_at(&mut ring, fd, buf.as_ptr(), len, written);
-                                    conns[fd as usize] = ConnState::Writing { buf, len, written, started_at, route, status };
+                            } else if res == 0 {
+                                should_close = true;
+                                break;
+                            } else {
+                                let err = std::io::Error::last_os_error();
+                                if err.kind() == std::io::ErrorKind::WouldBlock {
+                                    conns[client_fd as usize] = ConnState::Reading { buf, pos, started_at };
                                 } else {
-                                    api_log_timing!(Level::Info, Category::Request, "request_lifecycle", started_at, "fd={} route={} status={}", fd, route, status);
-                                    push_close(&mut ring, fd);
-                                    conns[fd as usize] = ConnState::Closing;
+                                    should_close = true;
                                 }
+                                break;
                             }
                         }
-                    } else {
-                        push_close(&mut ring, fd);
-                        conns[fd as usize] = ConnState::Closing;
+                    }
+                    if should_close {
+                        unsafe { libc::close(client_fd); }
+                        conns[client_fd as usize] = ConnState::Idle;
+                    }
+                } else if event.is_writable() {
+                    let mut should_close = false;
+                    if let ConnState::Writing { buf, len, mut written, started_at, route, status } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
+                        loop {
+                            let res = unsafe {
+                                libc::write(client_fd, buf.as_ptr().add(written) as *const libc::c_void, len - written)
+                            };
+
+                            if res > 0 {
+                                written += res as usize;
+                                if written == len {
+                                    crate::api_log_timing!(Level::Info, Category::Request, "request_lifecycle", started_at, "fd={} route={} status={}", client_fd, route, status);
+                                    should_close = true;
+                                    break;
+                                }
+                                continue;
+                            } else {
+                                let err = std::io::Error::last_os_error();
+                                if err.kind() == std::io::ErrorKind::WouldBlock {
+                                    conns[client_fd as usize] = ConnState::Writing { buf, len, written, started_at, route, status };
+                                } else {
+                                    should_close = true;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if should_close {
+                        unsafe { libc::close(client_fd); }
+                        conns[client_fd as usize] = ConnState::Idle;
                     }
                 }
-                3 => { // Close
-                    if (fd as usize) < MAX_FDS {
-                        conns[fd as usize] = ConnState::Idle;
-                    }
-                }
-                _ => {}
             }
         }
-    }
-}
-
-fn push_recvmsg(ring: &mut IoUring, fd: RawFd, msg: *mut libc::msghdr) {
-    unsafe {
-        (*msg).msg_controllen = 256;
-    }
-    let sqe = opcode::RecvMsg::new(types::Fd(fd), msg)
-        .build()
-        .user_data(0); // OP 0, FD 0
-    unsafe {
-        ring.submission().push(&sqe).ok();
-    }
-}
-
-fn push_read(ring: &mut IoUring, fd: RawFd, buf: *mut u8, len: usize) {
-    let sqe = opcode::Read::new(types::Fd(fd), buf, len as u32)
-        .build()
-        .user_data(((fd as u64) << 4) | 1);
-    unsafe {
-        ring.submission().push(&sqe).ok();
-    }
-}
-
-fn push_read_at(ring: &mut IoUring, fd: RawFd, buf: *mut u8, total_len: usize, pos: usize) {
-    let sqe = opcode::Read::new(types::Fd(fd), unsafe { buf.add(pos) }, (total_len - pos) as u32)
-        .build()
-        .user_data(((fd as u64) << 4) | 1);
-    unsafe {
-        ring.submission().push(&sqe).ok();
-    }
-}
-
-fn push_write(ring: &mut IoUring, fd: RawFd, buf: *const u8, len: usize) {
-    let sqe = opcode::Write::new(types::Fd(fd), buf, len as u32)
-        .build()
-        .user_data(((fd as u64) << 4) | 2);
-    unsafe {
-        ring.submission().push(&sqe).ok();
-    }
-}
-
-fn push_write_at(ring: &mut IoUring, fd: RawFd, buf: *const u8, total_len: usize, written: usize) {
-    let sqe = opcode::Write::new(types::Fd(fd), unsafe { buf.add(written) }, (total_len - written) as u32)
-        .build()
-        .user_data(((fd as u64) << 4) | 2);
-    unsafe {
-        ring.submission().push(&sqe).ok();
-    }
-}
-
-fn push_close(ring: &mut IoUring, fd: RawFd) {
-    let sqe = opcode::Close::new(types::Fd(fd))
-        .build()
-        .user_data(((fd as u64) << 4) | 3);
-    unsafe {
-        ring.submission().push(&sqe).ok();
     }
 }

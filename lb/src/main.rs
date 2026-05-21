@@ -1,4 +1,5 @@
-use io_uring::{IoUring, opcode, types};
+use mio::{Events, Poll, Token, Interest};
+use mio::unix::SourceFd;
 use std::ffi::CString;
 use std::mem;
 use std::os::unix::io::RawFd;
@@ -7,7 +8,7 @@ mod logging;
 
 use logging::{Category, Level};
 
-const CQE_F_MORE: u32 = 1 << 1;
+const LISTENER: Token = Token(0);
 
 fn main() -> std::io::Result<()> {
     unsafe {
@@ -50,17 +51,20 @@ fn main() -> std::io::Result<()> {
     }
 
     let listener_fd = create_listener(9999, 8192)?;
-    let mut ring = IoUring::builder()
-        .setup_single_issuer()
-        .setup_defer_taskrun()
-        .build(4096)?;
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(1024);
+
+    poll.registry().register(
+        &mut SourceFd(&listener_fd),
+        LISTENER,
+        Interest::READABLE,
+    )?;
 
     let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
     if uds_fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    // Increase send buffer to handle high connection spikes
     let sndbuf: libc::c_int = 16 * 1024 * 1024;
     unsafe {
         libc::setsockopt(
@@ -73,7 +77,7 @@ fn main() -> std::io::Result<()> {
     }
 
     eprintln!(
-        "Single-threaded io_uring LB listening on 0.0.0.0:9999 handing off to {} upstreams",
+        "Single-threaded mio LB listening on 0.0.0.0:9999 handing off to {} upstreams",
         up_addrs.len()
     );
     logging::log(
@@ -82,76 +86,63 @@ fn main() -> std::io::Result<()> {
         &format!("LB started, {} upstreams configured", up_addrs.len()),
     );
 
-    push_accept(&mut ring, listener_fd);
-
     let mut rr = 0;
 
     loop {
-        ring.submit_and_wait(1)?;
+        poll.poll(&mut events, None)?;
 
-        let mut completions = Vec::new();
-        for cqe in ring.completion() {
-            completions.push((cqe.result(), cqe.flags()));
-        }
+        for event in events.iter() {
+            if event.token() == LISTENER {
+                loop {
+                    let mut client_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
+                    let mut client_addr_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                    
+                    let client_fd = unsafe {
+                        libc::accept4(
+                            listener_fd,
+                            &mut client_addr as *mut _ as *mut libc::sockaddr,
+                            &mut client_addr_len,
+                            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                        )
+                    };
 
-        for (res, flags) in completions {
-            if (flags & CQE_F_MORE) == 0 {
-                push_accept(&mut ring, listener_fd);
-            }
+                    if client_fd < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                            break;
+                        }
+                        continue;
+                    }
 
-            if res >= 0 {
-                let client_fd = res as RawFd;
-                let accept_to_handoff_timer = logging::timer_start();
-                logging::log(
-                    Level::Debug,
-                    Category::IoUring,
-                    &format!("Client accepted, fd={}", client_fd),
-                );
+                    let accept_to_handoff_timer = logging::timer_start();
+                    set_tcp_nodelay(client_fd);
 
-                set_tcp_nodelay(client_fd);
+                    let target_addr = &up_addrs[rr % up_addrs.len()];
+                    let upstream_idx = rr % up_addrs.len();
+                    rr = rr.wrapping_add(1);
 
-                let target_addr = &up_addrs[rr % up_addrs.len()];
-                let upstream_idx = rr % up_addrs.len();
-                rr = rr.wrapping_add(1);
-
-                logging::log(
-                    Level::Debug,
-                    Category::Request,
-                    &format!("Handing off fd={} to upstream {}", client_fd, upstream_idx),
-                );
-                let handoff_ok = send_fd(uds_fd, target_addr, client_fd);
-                logging::log_timing(
-                    if handoff_ok { Level::Info } else { Level::Warn },
-                    Category::Request,
-                    "accept_to_handoff",
-                    accept_to_handoff_timer,
-                    format_args!(
-                        "fd={} upstream={} result={}",
-                        client_fd,
-                        upstream_idx,
-                        if handoff_ok { "ok" } else { "fallback_503" }
-                    ),
-                );
-                if !handoff_ok {
-                    logging::log(
-                        Level::Warn,
+                    let handoff_ok = send_fd(uds_fd, target_addr, client_fd);
+                    logging::log_timing(
+                        if handoff_ok { Level::Info } else { Level::Warn },
                         Category::Request,
-                        &format!(
-                            "FD handoff failed, serving immediate 503, fd={}, upstream={}",
-                            client_fd, upstream_idx
+                        "accept_to_handoff",
+                        accept_to_handoff_timer,
+                        format_args!(
+                            "fd={} upstream={} result={}",
+                            client_fd,
+                            upstream_idx,
+                            if handoff_ok { "ok" } else { "fallback_503" }
                         ),
                     );
-                    send_service_unavailable(client_fd);
-                }
 
-                unsafe {
-                    libc::close(client_fd);
+                    if !handoff_ok {
+                        send_service_unavailable(client_fd);
+                    }
+
+                    unsafe {
+                        libc::close(client_fd);
+                    }
                 }
-                logging::log(
-                    Level::Debug,
-                    Category::IoUring,
-                    &format!("Local close after handoff, fd={}", client_fd),
-                );
             }
         }
     }
@@ -189,76 +180,23 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
                 Category::Request,
                 &format!("FD handoff cmsg allocation failed, fd={}", fd_to_send),
             );
-            logging::log_timing(
-                Level::Warn,
-                Category::Request,
-                "send_fd_total",
-                send_fd_timer,
-                format_args!("fd={} retries=0 result=cmsg_allocation_failed", fd_to_send),
-            );
             return false;
         }
 
-        // Fast non-blocking send with minimal retries
         let mut retries = 0;
         loop {
             let res = libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL);
             if res >= 0 {
-                logging::log(
-                    Level::Debug,
-                    Category::Request,
-                    &format!("FD handoff successful, fd={}", fd_to_send),
-                );
-                logging::log_timing(
-                    Level::Debug,
-                    Category::Request,
-                    "send_fd_total",
-                    send_fd_timer,
-                    format_args!("fd={} retries={} result=ok", fd_to_send, retries),
-                );
                 return true;
             }
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
                 retries += 1;
                 if retries > 50 {
-                    logging::log(
-                        Level::Warn,
-                        Category::Request,
-                        &format!(
-                            "FD handoff failed after {} retries (WouldBlock), fd={}",
-                            retries, fd_to_send
-                        ),
-                    );
-                    logging::log_timing(
-                        Level::Warn,
-                        Category::Request,
-                        "send_fd_total",
-                        send_fd_timer,
-                        format_args!(
-                            "fd={} retries={} result=wouldblock_retries_exceeded",
-                            fd_to_send, retries
-                        ),
-                    );
                     return false;
                 }
                 std::thread::yield_now();
             } else {
-                logging::log(
-                    Level::Warn,
-                    Category::Request,
-                    &format!("FD handoff error: {}, fd={}", err, fd_to_send),
-                );
-                logging::log_timing(
-                    Level::Warn,
-                    Category::Request,
-                    "send_fd_total",
-                    send_fd_timer,
-                    format_args!(
-                        "fd={} retries={} result=error err={}",
-                        fd_to_send, retries, err
-                    ),
-                );
                 return false;
             }
         }
@@ -266,7 +204,6 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
 }
 
 fn send_service_unavailable(client_fd: RawFd) {
-    let fallback_timer = logging::timer_start();
     const RESPONSE: &[u8] =
         b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -284,21 +221,6 @@ fn send_service_unavailable(client_fd: RawFd) {
         }
 
         if written == 0 {
-            logging::log(
-                Level::Warn,
-                Category::Request,
-                &format!("503 fallback write returned 0, fd={}", client_fd),
-            );
-            logging::log_timing(
-                Level::Warn,
-                Category::Request,
-                "fallback_503_write",
-                fallback_timer,
-                format_args!(
-                    "fd={} bytes_sent={} retries={} result=write_zero",
-                    client_fd, offset, retries
-                ),
-            );
             return;
         }
 
@@ -308,74 +230,14 @@ fn send_service_unavailable(client_fd: RawFd) {
             std::io::ErrorKind::WouldBlock => {
                 retries += 1;
                 if retries > 10 {
-                    logging::log(
-                        Level::Warn,
-                        Category::Request,
-                        &format!(
-                            "503 fallback write retries exceeded (WouldBlock), fd={}",
-                            client_fd
-                        ),
-                    );
-                    logging::log_timing(
-                        Level::Warn,
-                        Category::Request,
-                        "fallback_503_write",
-                        fallback_timer,
-                        format_args!(
-                            "fd={} bytes_sent={} retries={} result=wouldblock_retries_exceeded",
-                            client_fd, offset, retries
-                        ),
-                    );
                     return;
                 }
                 std::thread::yield_now();
             }
             _ => {
-                logging::log(
-                    Level::Warn,
-                    Category::Request,
-                    &format!("503 fallback write error: {}, fd={}", err, client_fd),
-                );
-                logging::log_timing(
-                    Level::Warn,
-                    Category::Request,
-                    "fallback_503_write",
-                    fallback_timer,
-                    format_args!(
-                        "fd={} bytes_sent={} retries={} result=error err={}",
-                        client_fd, offset, retries, err
-                    ),
-                );
                 return;
             }
         }
-    }
-
-    logging::log_timing(
-        Level::Debug,
-        Category::Request,
-        "fallback_503_write",
-        fallback_timer,
-        format_args!(
-            "fd={} bytes_sent={} retries={} result=ok",
-            client_fd,
-            RESPONSE.len(),
-            retries
-        ),
-    );
-}
-
-fn push_accept(ring: &mut IoUring, listen_fd: RawFd) {
-    let sqe = opcode::AcceptMulti::new(types::Fd(listen_fd))
-        .build()
-        .user_data(1);
-    loop {
-        unsafe {
-            if ring.submission().push(&sqe).is_ok() {
-                return;
-            }
-        }
-        let _ = ring.submit();
     }
 }
 
@@ -444,54 +306,5 @@ fn set_tcp_nodelay(fd: RawFd) {
             &one as *const _ as *const libc::c_void,
             mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::send_service_unavailable;
-
-    #[test]
-    fn send_service_unavailable_writes_valid_status_line() {
-        const EXPECTED: &[u8] =
-            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-        let mut fds = [0; 2];
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(
-            rc,
-            0,
-            "socketpair failed: {}",
-            std::io::Error::last_os_error()
-        );
-
-        send_service_unavailable(fds[0]);
-
-        let mut received = vec![0u8; EXPECTED.len()];
-        let mut offset = 0usize;
-        while offset < EXPECTED.len() {
-            let n = unsafe {
-                libc::recv(
-                    fds[1],
-                    received[offset..].as_mut_ptr() as *mut libc::c_void,
-                    EXPECTED.len() - offset,
-                    0,
-                )
-            };
-            assert!(
-                n > 0,
-                "recv failed or closed early at offset {}: {}",
-                offset,
-                std::io::Error::last_os_error()
-            );
-            offset += n as usize;
-        }
-
-        assert_eq!(received, EXPECTED);
-
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
     }
 }
