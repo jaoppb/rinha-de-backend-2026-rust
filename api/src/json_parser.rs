@@ -1,4 +1,4 @@
-use memchr::memchr;
+use memchr::{memchr, memchr2, memchr3};
 
 pub struct ParsedTransaction<'a> {
     pub amount: f32,
@@ -38,7 +38,7 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
     
     // We expect the top level keys: "id", "transaction", "customer", "merchant", "terminal", "last_transaction"
     while i < body.len() {
-        let key = next_key(body, &mut i)?;
+        let key = if let Some(k) = next_key(body, &mut i) { k } else { break; };
         match key {
             b"transaction" => {
                 skip_to(body, &mut i, b'{')?;
@@ -129,48 +129,58 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
 }
 
 fn next_key<'a>(body: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
-    while *i < body.len() && body[*i] != b'"' { *i += 1; }
-    if *i >= body.len() { return None; }
+    *i += memchr(b'"', &body[*i..])?;
     *i += 1;
     let start = *i;
-    while *i < body.len() && body[*i] != b'"' { *i += 1; }
+    *i += memchr(b'"', &body[*i..])?;
     let key = &body[start..*i];
     *i += 1;
-    while *i < body.len() && body[*i] != b':' { *i += 1; }
+    *i += memchr(b':', &body[*i..])?;
     *i += 1;
     while *i < body.len() && body[*i].is_ascii_whitespace() { *i += 1; }
     Some(key)
 }
 
 fn next_key_in_object<'a>(body: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
-    while *i < body.len() && body[*i] != b'"' && body[*i] != b'}' { *i += 1; }
-    if *i >= body.len() || body[*i] == b'}' {
-        if *i < body.len() { *i += 1; }
-        return None;
+    if let Some(pos) = memchr2(b'"', b'}', &body[*i..]) {
+        *i += pos;
+        if body[*i] == b'}' {
+            *i += 1;
+            return None;
+        }
+        next_key(body, i)
+    } else {
+        *i = body.len();
+        None
     }
-    next_key(body, i)
 }
 
 fn next_str_in_array<'a>(body: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
-    while *i < body.len() && body[*i] != b'"' && body[*i] != b']' { *i += 1; }
-    if *i >= body.len() || body[*i] == b']' {
-        if *i < body.len() { *i += 1; }
-        return None;
+    if let Some(pos) = memchr2(b'"', b']', &body[*i..]) {
+        *i += pos;
+        if body[*i] == b']' {
+            *i += 1;
+            return None;
+        }
+        *i += 1;
+        let start = *i;
+        if let Some(end_pos) = memchr(b'"', &body[*i..]) {
+            *i += end_pos;
+            let s = &body[start..*i];
+            *i += 1;
+            return Some(s);
+        }
     }
-    *i += 1;
-    let start = *i;
-    while *i < body.len() && body[*i] != b'"' { *i += 1; }
-    let s = &body[start..*i];
-    *i += 1;
-    Some(s)
+    *i = body.len();
+    None
 }
 
 fn skip_to(body: &[u8], i: &mut usize, target: u8) -> Option<()> {
-    while *i < body.len() && body[*i] != target { *i += 1; }
-    if *i < body.len() {
-        *i += 1;
+    if let Some(pos) = memchr(target, &body[*i..]) {
+        *i += pos + 1;
         Some(())
     } else {
+        *i = body.len();
         None
     }
 }
@@ -184,22 +194,36 @@ fn skip_value(body: &[u8], i: &mut usize) {
             let mut depth = 1;
             *i += 1;
             while *i < body.len() && depth > 0 {
-                if body[*i] == b'{' { depth += 1; }
-                else if body[*i] == b'}' { depth -= 1; }
-                *i += 1;
+                if let Some(pos) = memchr2(b'{', b'}', &body[*i..]) {
+                    *i += pos;
+                    if body[*i] == b'{' { depth += 1; } else { depth -= 1; }
+                    *i += 1;
+                } else {
+                    *i = body.len();
+                    break;
+                }
             }
         }
         b'[' => {
             let mut depth = 1;
             *i += 1;
             while *i < body.len() && depth > 0 {
-                if body[*i] == b'[' { depth += 1; }
-                else if body[*i] == b']' { depth -= 1; }
-                *i += 1;
+                if let Some(pos) = memchr2(b'[', b']', &body[*i..]) {
+                    *i += pos;
+                    if body[*i] == b'[' { depth += 1; } else { depth -= 1; }
+                    *i += 1;
+                } else {
+                    *i = body.len();
+                    break;
+                }
             }
         }
         _ => {
-            while *i < body.len() && !matches!(body[*i], b',' | b'}' | b']') { *i += 1; }
+            if let Some(pos) = memchr3(b',', b'}', b']', &body[*i..]) {
+                *i += pos;
+            } else {
+                *i = body.len();
+            }
         }
     }
 }
@@ -241,14 +265,18 @@ fn parse_u32(body: &[u8], i: &mut usize) -> u32 {
 }
 
 fn parse_str<'a>(body: &'a [u8], i: &mut usize) -> &'a [u8] {
-    while *i < body.len() && body[*i] != b'"' { *i += 1; }
-    if *i >= body.len() { return &b""[..]; }
-    *i += 1;
-    let start = *i;
-    while *i < body.len() && body[*i] != b'"' { *i += 1; }
-    let s = &body[start..*i];
-    if *i < body.len() { *i += 1; }
-    s
+    if let Some(pos) = memchr(b'"', &body[*i..]) {
+        *i += pos + 1;
+        let start = *i;
+        if let Some(end_pos) = memchr(b'"', &body[*i..]) {
+            *i += end_pos;
+            let s = &body[start..*i];
+            *i += 1;
+            return s;
+        }
+    }
+    *i = body.len();
+    &b""[..]
 }
 
 fn parse_bool(body: &[u8], i: &mut usize) -> bool {
@@ -306,3 +334,5 @@ pub fn parse_minutes_diff(ts1: &[u8], ts2: &[u8]) -> Option<f32> {
     let m2 = to_minutes(ts2)?;
     Some((m1 - m2).abs() as f32)
 }
+
+
