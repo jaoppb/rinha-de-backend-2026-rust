@@ -1,3 +1,5 @@
+use memchr::memchr;
+
 pub struct ParsedTransaction<'a> {
     pub amount: f32,
     pub installments: u8,
@@ -16,187 +18,97 @@ pub struct ParsedTransaction<'a> {
 }
 
 pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
-    let mut i = 0;
-
-    macro_rules! skip_to_colon {
-        () => {
-            while i < body.len() && body[i] != b':' {
-                i += 1;
-            }
-            if i >= body.len() {
-                return None;
-            }
-            i += 1; // skip ':'
-        };
-    }
-
-    macro_rules! parse_f32 {
-        () => {{
-            while i < body.len() && !body[i].is_ascii_digit() && body[i] != b'-' {
-                i += 1;
-            }
-            let mut neg = false;
-            if i < body.len() && body[i] == b'-' {
-                neg = true;
-                i += 1;
-            }
-            let mut int_part: u32 = 0;
-            while i < body.len() && body[i].is_ascii_digit() {
-                int_part = int_part * 10 + (body[i] - b'0') as u32;
-                i += 1;
-            }
-            let mut val = int_part as f32;
-            if i < body.len() && body[i] == b'.' {
-                i += 1;
-                let mut frac_part: u32 = 0;
-                let mut divisor: f32 = 1.0;
-                while i < body.len() && body[i].is_ascii_digit() {
-                    frac_part = frac_part * 10 + (body[i] - b'0') as u32;
-                    divisor *= 10.0;
-                    i += 1;
-                }
-                val += (frac_part as f32) / divisor;
-            }
-            if neg {
-                -val
-            } else {
-                val
-            }
-        }};
-    }
-
-    macro_rules! parse_u32 {
-        () => {{
-            while i < body.len() && !body[i].is_ascii_digit() {
-                i += 1;
-            }
-            let mut val: u32 = 0;
-            while i < body.len() && body[i].is_ascii_digit() {
-                val = val * 10 + (body[i] - b'0') as u32;
-                i += 1;
-            }
-            val
-        }};
-    }
-
-    macro_rules! parse_str {
-        () => {{
-            while i < body.len() && body[i] != b'"' {
-                i += 1;
-            }
-            i += 1;
-            let start = i;
-            while i < body.len() && body[i] != b'"' {
-                i += 1;
-            }
-            let s = &body[start..i];
-            i += 1;
-            s
-        }};
-    }
-
-    macro_rules! parse_bool {
-        () => {{
-            while i < body.len() && body[i] != b't' && body[i] != b'f' {
-                i += 1;
-            }
-            if i >= body.len() {
-                return None;
-            }
-            let b = body[i] == b't';
-            while i < body.len() && body[i].is_ascii_alphabetic() {
-                i += 1;
-            }
-            b
-        }};
-    }
-
-    skip_to_colon!(); // id
-    let _id = parse_str!();
-
-    skip_to_colon!(); // transaction (object start)
-    skip_to_colon!(); // amount
-    let amount = parse_f32!();
-
-    skip_to_colon!(); // installments
-    let installments = parse_u32!() as u8;
-
-    skip_to_colon!(); // requested_at
-    let requested_at = parse_str!();
-
-    skip_to_colon!(); // customer (object start)
-    skip_to_colon!(); // avg_amount
-    let customer_avg_amount = parse_f32!();
-
-    skip_to_colon!(); // tx_count_24h
-    let customer_tx_count_24h = parse_u32!();
-
-    skip_to_colon!(); // known_merchants (array start)
+    let mut amount = 0.0;
+    let mut installments = 0;
+    let mut requested_at = &b""[..];
+    let mut customer_avg_amount = 0.0;
+    let mut customer_tx_count_24h = 0;
     let mut customer_known_merchants = Vec::with_capacity(8);
-    while i < body.len() && body[i] != b']' {
-        if body[i] == b'"' {
-            customer_known_merchants.push(parse_str!());
-        } else {
-            i += 1;
+    let mut merchant_id = &b""[..];
+    let mut merchant_mcc = 0;
+    let mut merchant_avg_amount = 0.0;
+    let mut is_online = false;
+    let mut card_present = false;
+    let mut km_from_home = 0.0;
+    let mut last_tx_timestamp = None;
+    let mut last_tx_km = None;
+    let mut has_last_tx = false;
+
+    let mut i = 0;
+    
+    // We expect the top level keys: "id", "transaction", "customer", "merchant", "terminal", "last_transaction"
+    while i < body.len() {
+        let key = next_key(body, &mut i)?;
+        match key {
+            b"transaction" => {
+                skip_to(body, &mut i, b'{')?;
+                while let Some(k) = next_key_in_object(body, &mut i) {
+                    match k {
+                        b"amount" => amount = parse_f32(body, &mut i),
+                        b"installments" => installments = parse_u32(body, &mut i) as u8,
+                        b"requested_at" => requested_at = parse_str(body, &mut i),
+                        _ => skip_value(body, &mut i),
+                    }
+                }
+            }
+            b"customer" => {
+                skip_to(body, &mut i, b'{')?;
+                while let Some(k) = next_key_in_object(body, &mut i) {
+                    match k {
+                        b"avg_amount" => customer_avg_amount = parse_f32(body, &mut i),
+                        b"tx_count_24h" => customer_tx_count_24h = parse_u32(body, &mut i),
+                        b"known_merchants" => {
+                            skip_to(body, &mut i, b'[')?;
+                            while let Some(s) = next_str_in_array(body, &mut i) {
+                                customer_known_merchants.push(s);
+                            }
+                        }
+                        _ => skip_value(body, &mut i),
+                    }
+                }
+            }
+            b"merchant" => {
+                skip_to(body, &mut i, b'{')?;
+                while let Some(k) = next_key_in_object(body, &mut i) {
+                    match k {
+                        b"id" => merchant_id = parse_str(body, &mut i),
+                        b"mcc" => merchant_mcc = parse_u16_from_str(body, &mut i),
+                        b"avg_amount" => merchant_avg_amount = parse_f32(body, &mut i),
+                        _ => skip_value(body, &mut i),
+                    }
+                }
+            }
+            b"terminal" => {
+                skip_to(body, &mut i, b'{')?;
+                while let Some(k) = next_key_in_object(body, &mut i) {
+                    match k {
+                        b"is_online" => is_online = parse_bool(body, &mut i),
+                        b"card_present" => card_present = parse_bool(body, &mut i),
+                        b"km_from_home" => km_from_home = parse_f32(body, &mut i),
+                        _ => skip_value(body, &mut i),
+                    }
+                }
+            }
+            b"last_transaction" => {
+                while i < body.len() && body[i].is_ascii_whitespace() { i += 1; }
+                if i + 4 <= body.len() && &body[i..i+4] == b"null" {
+                    has_last_tx = false;
+                    i += 4;
+                } else {
+                    has_last_tx = true;
+                    skip_to(body, &mut i, b'{')?;
+                    while let Some(k) = next_key_in_object(body, &mut i) {
+                        match k {
+                            b"timestamp" => last_tx_timestamp = Some(parse_str(body, &mut i)),
+                            b"km_from_current" => last_tx_km = Some(parse_f32(body, &mut i)),
+                            _ => skip_value(body, &mut i),
+                        }
+                    }
+                }
+            }
+            _ => skip_value(body, &mut i),
         }
     }
-
-    skip_to_colon!(); // merchant (object start)
-    skip_to_colon!(); // id
-    let merchant_id = parse_str!();
-
-    skip_to_colon!(); // mcc
-    let merchant_mcc = parse_str!();
-    let merchant_mcc_u16 = std::str::from_utf8(merchant_mcc)
-        .ok()?
-        .parse::<u16>()
-        .ok()?;
-
-    skip_to_colon!(); // avg_amount
-    let merchant_avg_amount = parse_f32!();
-
-    skip_to_colon!(); // terminal (object start)
-    skip_to_colon!(); // is_online
-    let is_online = parse_bool!();
-
-    skip_to_colon!(); // card_present
-    let card_present = parse_bool!();
-
-    skip_to_colon!(); // km_from_home
-    let km_from_home = parse_f32!();
-
-    skip_to_colon!(); // last_transaction
-    while i < body.len() && body[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i + 4 <= body.len() && &body[i..i + 4] == b"null" {
-        return Some(ParsedTransaction {
-            amount,
-            installments,
-            requested_at,
-            customer_avg_amount,
-            customer_tx_count_24h,
-            customer_known_merchants,
-            merchant_id,
-            merchant_mcc: merchant_mcc_u16,
-            merchant_avg_amount,
-            is_online,
-            card_present,
-            km_from_home,
-            last_tx_timestamp: None,
-            last_tx_km: None,
-        });
-    }
-
-    if i >= body.len() {
-        return None;
-    }
-
-    skip_to_colon!(); // timestamp
-    let last_tx_timestamp = Some(parse_str!());
-
-    skip_to_colon!(); // km_from_current
-    let last_tx_km = Some(parse_f32!());
 
     Some(ParsedTransaction {
         amount,
@@ -206,48 +118,177 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
         customer_tx_count_24h,
         customer_known_merchants,
         merchant_id,
-        merchant_mcc: merchant_mcc_u16,
+        merchant_mcc,
         merchant_avg_amount,
         is_online,
         card_present,
         km_from_home,
-        last_tx_timestamp,
-        last_tx_km,
+        last_tx_timestamp: if has_last_tx { last_tx_timestamp } else { None },
+        last_tx_km: if has_last_tx { last_tx_km } else { None },
     })
 }
 
-pub fn parse_timestamp(ts: &[u8]) -> Option<(u8, u8)> {
-    if ts.len() < 13 {
+fn next_key<'a>(body: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
+    while *i < body.len() && body[*i] != b'"' { *i += 1; }
+    if *i >= body.len() { return None; }
+    *i += 1;
+    let start = *i;
+    while *i < body.len() && body[*i] != b'"' { *i += 1; }
+    let key = &body[start..*i];
+    *i += 1;
+    while *i < body.len() && body[*i] != b':' { *i += 1; }
+    *i += 1;
+    while *i < body.len() && body[*i].is_ascii_whitespace() { *i += 1; }
+    Some(key)
+}
+
+fn next_key_in_object<'a>(body: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
+    while *i < body.len() && body[*i] != b'"' && body[*i] != b'}' { *i += 1; }
+    if *i >= body.len() || body[*i] == b'}' {
+        if *i < body.len() { *i += 1; }
         return None;
     }
+    next_key(body, i)
+}
+
+fn next_str_in_array<'a>(body: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
+    while *i < body.len() && body[*i] != b'"' && body[*i] != b']' { *i += 1; }
+    if *i >= body.len() || body[*i] == b']' {
+        if *i < body.len() { *i += 1; }
+        return None;
+    }
+    *i += 1;
+    let start = *i;
+    while *i < body.len() && body[*i] != b'"' { *i += 1; }
+    let s = &body[start..*i];
+    *i += 1;
+    Some(s)
+}
+
+fn skip_to(body: &[u8], i: &mut usize, target: u8) -> Option<()> {
+    while *i < body.len() && body[*i] != target { *i += 1; }
+    if *i < body.len() {
+        *i += 1;
+        Some(())
+    } else {
+        None
+    }
+}
+
+fn skip_value(body: &[u8], i: &mut usize) {
+    while *i < body.len() && body[*i].is_ascii_whitespace() { *i += 1; }
+    if *i >= body.len() { return; }
+    match body[*i] {
+        b'"' => { parse_str(body, i); }
+        b'{' => {
+            let mut depth = 1;
+            *i += 1;
+            while *i < body.len() && depth > 0 {
+                if body[*i] == b'{' { depth += 1; }
+                else if body[*i] == b'}' { depth -= 1; }
+                *i += 1;
+            }
+        }
+        b'[' => {
+            let mut depth = 1;
+            *i += 1;
+            while *i < body.len() && depth > 0 {
+                if body[*i] == b'[' { depth += 1; }
+                else if body[*i] == b']' { depth -= 1; }
+                *i += 1;
+            }
+        }
+        _ => {
+            while *i < body.len() && !matches!(body[*i], b',' | b'}' | b']') { *i += 1; }
+        }
+    }
+}
+
+fn parse_f32(body: &[u8], i: &mut usize) -> f32 {
+    while *i < body.len() && !body[*i].is_ascii_digit() && body[*i] != b'-' { *i += 1; }
+    let mut neg = false;
+    if *i < body.len() && body[*i] == b'-' {
+        neg = true;
+        *i += 1;
+    }
+    let mut val = 0.0;
+    while *i < body.len() && body[*i].is_ascii_digit() {
+        val = val * 10.0 + (body[*i] - b'0') as f32;
+        *i += 1;
+    }
+    if *i < body.len() && body[*i] == b'.' {
+        *i += 1;
+        let mut frac = 0.0;
+        let mut div = 10.0;
+        while *i < body.len() && body[*i].is_ascii_digit() {
+            frac += (body[*i] - b'0') as f32 / div;
+            div *= 10.0;
+            *i += 1;
+        }
+        val += frac;
+    }
+    if neg { -val } else { val }
+}
+
+fn parse_u32(body: &[u8], i: &mut usize) -> u32 {
+    while *i < body.len() && !body[*i].is_ascii_digit() { *i += 1; }
+    let mut val = 0;
+    while *i < body.len() && body[*i].is_ascii_digit() {
+        val = val * 10 + (body[*i] - b'0') as u32;
+        *i += 1;
+    }
+    val
+}
+
+fn parse_str<'a>(body: &'a [u8], i: &mut usize) -> &'a [u8] {
+    while *i < body.len() && body[*i] != b'"' { *i += 1; }
+    if *i >= body.len() { return &b""[..]; }
+    *i += 1;
+    let start = *i;
+    while *i < body.len() && body[*i] != b'"' { *i += 1; }
+    let s = &body[start..*i];
+    if *i < body.len() { *i += 1; }
+    s
+}
+
+fn parse_bool(body: &[u8], i: &mut usize) -> bool {
+    while *i < body.len() && body[*i] != b't' && body[*i] != b'f' { *i += 1; }
+    if *i >= body.len() { return false; }
+    let b = body[*i] == b't';
+    while *i < body.len() && body[*i].is_ascii_alphabetic() { *i += 1; }
+    b
+}
+
+fn parse_u16_from_str(body: &[u8], i: &mut usize) -> u16 {
+    let s = parse_str(body, i);
+    let mut val = 0u16;
+    for &b in s {
+        if b.is_ascii_digit() {
+            val = val * 10 + (b - b'0') as u16;
+        }
+    }
+    val
+}
+
+pub fn parse_timestamp(ts: &[u8]) -> Option<(u8, u8)> {
+    if ts.len() < 13 { return None; }
     let hour = (ts[11] - b'0') * 10 + (ts[12] - b'0');
     let year = ((ts[0] - b'0') as i32) * 1000 + ((ts[1] - b'0') as i32) * 100 + ((ts[2] - b'0') as i32) * 10 + ((ts[3] - b'0') as i32);
     let month = ((ts[5] - b'0') as i32) * 10 + ((ts[6] - b'0') as i32);
     let day = ((ts[8] - b'0') as i32) * 10 + ((ts[9] - b'0') as i32);
 
-    if month < 1 || month > 12 {
-        return None;
-    }
-
+    if month < 1 || month > 12 { return None; }
     let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     let mut y = year;
-    if month < 3 {
-        y -= 1;
-    }
+    if month < 3 { y -= 1; }
     let dow_sun_start = (y + y / 4 - y / 100 + y / 400 + t[(month - 1) as usize] + day) % 7;
-    let dow = if dow_sun_start == 0 {
-        6
-    } else {
-        (dow_sun_start - 1) as u8
-    };
+    let dow = if dow_sun_start == 0 { 6 } else { (dow_sun_start - 1) as u8 };
     Some((hour, dow))
 }
 
 pub fn parse_minutes_diff(ts1: &[u8], ts2: &[u8]) -> Option<f32> {
     fn to_minutes(ts: &[u8]) -> Option<i64> {
-        if ts.len() < 16 {
-            return None;
-        }
+        if ts.len() < 16 { return None; }
         let year = ((ts[0] - b'0') as i64) * 1000 + ((ts[1] - b'0') as i64) * 100 + ((ts[2] - b'0') as i64) * 10 + ((ts[3] - b'0') as i64);
         let month = ((ts[5] - b'0') as i64) * 10 + ((ts[6] - b'0') as i64);
         let day = ((ts[8] - b'0') as i64) * 10 + ((ts[9] - b'0') as i64);
@@ -256,16 +297,11 @@ pub fn parse_minutes_diff(ts1: &[u8], ts2: &[u8]) -> Option<f32> {
 
         let mut total_days = (year - 2000) * 365 + (year - 2000) / 4;
         let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for i in 0..(month - 1) as usize {
-            total_days += month_days[i];
-        }
-        if month > 2 && year % 4 == 0 {
-            total_days += 1;
-        }
+        for i in 0..(month - 1) as usize { total_days += month_days[i]; }
+        if month > 2 && year % 4 == 0 { total_days += 1; }
         total_days += day;
         Some(total_days * 1440 + hour * 60 + min)
     }
-
     let m1 = to_minutes(ts1)?;
     let m2 = to_minutes(ts2)?;
     Some((m1 - m2).abs() as f32)

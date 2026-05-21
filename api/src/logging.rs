@@ -192,7 +192,34 @@ fn format_timing_line(
     }
 }
 
-pub fn log(level: Level, category: Category, msg: &str) {
+#[macro_export]
+macro_rules! api_log {
+    ($level:expr, $category:expr, $msg:expr) => {
+        #[cfg(feature = "verbose-logging")]
+        {
+            $crate::logging::_log($level, $category, $msg);
+        }
+    };
+    ($level:expr, $category:expr, $($arg:tt)*) => {
+        #[cfg(feature = "verbose-logging")]
+        {
+            $crate::logging::_log($level, $category, &format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! api_log_timing {
+    ($level:expr, $category:expr, $op:expr, $started_at:expr, $($arg:tt)*) => {
+        #[cfg(feature = "verbose-logging")]
+        {
+            $crate::logging::_log_timing($level, $category, $op, $started_at, format_args!($($arg)*));
+        }
+    };
+}
+
+#[doc(hidden)]
+pub fn _log(level: Level, category: Category, msg: &str) {
     #[cfg(feature = "verbose-logging")]
     {
         eprintln!("{}", format_log_line(transport(), level, category, msg));
@@ -203,7 +230,8 @@ pub fn log(level: Level, category: Category, msg: &str) {
     }
 }
 
-pub fn log_timing(
+#[doc(hidden)]
+pub fn _log_timing(
     level: Level,
     category: Category,
     op: &str,

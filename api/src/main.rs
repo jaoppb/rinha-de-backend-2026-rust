@@ -14,12 +14,37 @@ use std::rc::Rc;
 use crate::http_parser::{HttpRoute, parse_http_request};
 use crate::json_parser::parse_json_payload;
 use crate::knn::IvfIndex;
-use crate::logging::{Category, Level};
+use crate::logging::{Category, Level, Timer};
 use crate::mmap::{load_dataset, load_ivf_data, load_lookups};
 use crate::vectorizer::vectorize;
 
 const RING_SIZE: u32 = 4096;
 const BUF_SIZE: usize = 16 * 1024;
+const MAX_FDS: usize = 1024;
+
+enum ConnState {
+    Idle,
+    Reading {
+        buf: Box<[u8; BUF_SIZE]>,
+        pos: usize,
+        started_at: Timer,
+    },
+    Writing {
+        buf: Box<[u8; BUF_SIZE]>,
+        len: usize,
+        written: usize,
+        started_at: Timer,
+        route: &'static str,
+        status: u16,
+    },
+    Closing,
+}
+
+struct AppState {
+    lookups: Rc<crate::mmap::LookupData>,
+    dataset: crate::mmap::Dataset,
+    index: Rc<IvfIndex>,
+}
 
 fn main() -> std::io::Result<()> {
     unsafe {
@@ -78,11 +103,8 @@ fn main() -> std::io::Result<()> {
         let _ = tx.send((l, d, i));
     });
 
-    let mut state: Option<(
-        Rc<crate::mmap::LookupData>,
-        crate::mmap::Dataset,
-        Rc<IvfIndex>,
-    )> = None;
+    let mut app_state: Option<AppState> = None;
+    let mut conns: Vec<ConnState> = (0..MAX_FDS).map(|_| ConnState::Idle).collect();
 
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     let mut iov_base = [0u8; 1];
@@ -96,26 +118,21 @@ fn main() -> std::io::Result<()> {
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = cmsg_buf.len() as _;
 
-    let mut read_buf = vec![0u8; BUF_SIZE];
-    let mut write_buf = vec![0u8; BUF_SIZE];
-    let mut current_pos = 0;
-    let mut request_started_at: Option<logging::Timer> = None;
-    let mut pending_write_timing: Option<(RawFd, logging::Timer, &'static str, u16)> = None;
-
+    // Initial RecvMsg to start accepting FDs
     push_recvmsg(&mut ring, uds_fd, &mut msg);
 
     loop {
         ring.submit_and_wait(1)?;
 
-        if state.is_none() {
+        if app_state.is_none() {
             if let Ok((l, d, i)) = rx.try_recv() {
-                state = Some((Rc::new(l), d, Rc::new(IvfIndex::new(i))));
+                app_state = Some(AppState {
+                    lookups: Rc::new(l),
+                    dataset: d,
+                    index: Rc::new(IvfIndex::new(i)),
+                });
                 println!("Successfully loaded all datasets.");
-                logging::log(
-                    Level::Info,
-                    Category::Request,
-                    "Datasets loaded successfully",
-                );
+                api_log!(Level::Info, Category::Request, "Datasets loaded successfully");
             }
         }
 
@@ -125,300 +142,160 @@ fn main() -> std::io::Result<()> {
         }
 
         for (res, user_data) in cqes_data {
-            if user_data == 0 {
-                // RecvMsg
-                if res >= 0 {
-                    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-                    if !cmsg.is_null()
-                        && unsafe {
-                            (*cmsg).cmsg_level == libc::SOL_SOCKET
-                                && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+            let op = user_data & 0xF;
+            let fd = (user_data >> 4) as RawFd;
+
+            match op {
+                0 => { // RecvMsg (New FD)
+                    if res >= 0 {
+                        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+                        if !cmsg.is_null()
+                            && unsafe {
+                                (*cmsg).cmsg_level == libc::SOL_SOCKET
+                                    && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+                            }
+                        {
+                            let client_fd = unsafe { *(libc::CMSG_DATA(cmsg) as *mut libc::c_int) };
+                            if (client_fd as usize) < MAX_FDS {
+                                let mut buf = Box::new([0u8; BUF_SIZE]);
+                                let started_at = logging::timer_start();
+                                push_read(&mut ring, client_fd, buf.as_mut_ptr(), BUF_SIZE);
+                                conns[client_fd as usize] = ConnState::Reading {
+                                    buf,
+                                    pos: 0,
+                                    started_at,
+                                };
+                            } else {
+                                api_log!(Level::Warn, Category::Request, "FD {} exceeds MAX_FDS", client_fd);
+                                unsafe { libc::close(client_fd); }
+                            }
                         }
-                    {
-                        let fd = unsafe { *(libc::CMSG_DATA(cmsg) as *mut libc::c_int) };
-                        current_pos = 0;
-                        request_started_at = Some(logging::timer_start());
-                        pending_write_timing = None;
-                        push_read(&mut ring, fd, read_buf.as_mut_ptr(), BUF_SIZE);
-                    } else {
-                        push_recvmsg(&mut ring, uds_fd, &mut msg);
                     }
-                } else {
+                    // Always repush RecvMsg to keep accepting
                     push_recvmsg(&mut ring, uds_fd, &mut msg);
                 }
-            } else if (user_data & 0x1) == 1 {
-                // Read
-                let fd = (user_data >> 1) as RawFd;
-                if res > 0 {
-                    current_pos += res as usize;
-                    logging::log(
-                        Level::Debug,
-                        Category::IoUring,
-                        &format!("Read {} bytes, total buffer pos: {}", res, current_pos),
-                    );
-                    let parse_timer = logging::timer_start();
-                    let (route, _) = parse_http_request(&read_buf[..current_pos]);
-                    let route_name = match &route {
-                        HttpRoute::Ready => "ready",
-                        HttpRoute::FraudScore(_) => "fraud-score",
-                        HttpRoute::NotFound => "not-found",
-                        HttpRoute::Incomplete => "incomplete",
-                    };
-                    logging::log_timing(
-                        Level::Debug,
-                        Category::Request,
-                        "parse_http_request",
-                        parse_timer,
-                        format_args!("fd={} route={} bytes={}", fd, route_name, current_pos),
-                    );
-                    match route {
-                        HttpRoute::Incomplete => {
-                            logging::log(
-                                Level::Debug,
-                                Category::Request,
-                                "Request incomplete, waiting for more data",
-                            );
-                            if current_pos < BUF_SIZE {
-                                unsafe {
-                                    push_read(
-                                        &mut ring,
-                                        fd,
-                                        read_buf.as_mut_ptr().add(current_pos),
-                                        BUF_SIZE - current_pos,
-                                    );
+                1 => { // Read
+                    if res > 0 {
+                        let client_fd = fd;
+                        if let ConnState::Reading { mut buf, mut pos, started_at } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
+                            pos += res as usize;
+                            let (route, _) = parse_http_request(&buf[..pos]);
+                            
+                            match route {
+                                HttpRoute::Incomplete => {
+                                    if pos < BUF_SIZE {
+                                        push_read_at(&mut ring, client_fd, buf.as_mut_ptr(), BUF_SIZE, pos);
+                                        conns[client_fd as usize] = ConnState::Reading { buf, pos, started_at };
+                                    } else {
+                                        api_log!(Level::Warn, Category::Request, "Buffer full for fd {}", client_fd);
+                                        push_close(&mut ring, client_fd);
+                                        conns[client_fd as usize] = ConnState::Closing;
+                                    }
                                 }
-                            } else {
-                                logging::log(
-                                    Level::Warn,
-                                    Category::Request,
-                                    "Buffer full, closing connection",
-                                );
-                                push_close(&mut ring, fd);
-                            }
-                        }
-                        HttpRoute::Ready => {
-                            logging::log(Level::Info, Category::Request, "Route: Ready");
-                            let is_ready = state.is_some();
-                            let resp: &[u8] = if is_ready {
-                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-                            } else {
-                                logging::log(
-                                    Level::Warn,
-                                    Category::Request,
-                                    "Ready endpoint called but state not ready",
-                                );
-                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
-                            };
-                            write_buf[..resp.len()].copy_from_slice(resp);
-                            if let Some(started_at) = request_started_at.take() {
-                                pending_write_timing = Some((
-                                    fd,
-                                    started_at,
-                                    "ready",
-                                    if is_ready { 200 } else { 503 },
-                                ));
-                            }
-                            push_write(&mut ring, fd, write_buf.as_ptr(), resp.len());
-                        }
-                        HttpRoute::FraudScore(body) => {
-                            logging::log(
-                                Level::Info,
-                                Category::Request,
-                                &format!("Route: FraudScore, body_size: {}", body.len()),
-                            );
-                            if let Some((lookups, dataset, index)) = state.as_ref() {
-                                let parse_json_timer = logging::timer_start();
-                                let tx = if body.is_empty() {
-                                    None
-                                } else {
-                                    parse_json_payload(body)
-                                };
-                                logging::log_timing(
-                                    Level::Debug,
-                                    Category::Request,
-                                    "parse_json_payload",
-                                    parse_json_timer,
-                                    format_args!(
-                                        "fd={} body_size={} parsed={}",
-                                        fd,
-                                        body.len(),
-                                        tx.is_some()
-                                    ),
-                                );
-
-                                let (response, status_code) = match tx {
-                                    Some(tx) => {
-                                        let vectorize_timer = logging::timer_start();
-                                        let maybe_vec = vectorize(&tx, lookups);
-                                        logging::log_timing(
-                                            if maybe_vec.is_some() {
-                                                Level::Debug
+                                HttpRoute::Ready => {
+                                    let is_ready = app_state.is_some();
+                                    let resp: &[u8] = if is_ready {
+                                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                                    } else {
+                                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+                                    };
+                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                    w_buf[..resp.len()].copy_from_slice(resp);
+                                    push_write(&mut ring, client_fd, w_buf.as_ptr(), resp.len());
+                                    conns[client_fd as usize] = ConnState::Writing {
+                                        buf: w_buf,
+                                        len: resp.len(),
+                                        written: 0,
+                                        started_at,
+                                        route: "ready",
+                                        status: if is_ready { 200 } else { 503 },
+                                    };
+                                }
+                                HttpRoute::FraudScore(body_bytes) => {
+                                    let (resp_str, status) = if let Some(state) = &app_state {
+                                        let tx = if body_bytes.is_empty() { None } else { parse_json_payload(body_bytes) };
+                                        if let Some(tx) = tx {
+                                            if let Some(vec) = vectorize(&tx, &state.lookups) {
+                                                let (approved, score) = state.index.search(&vec, state.dataset.records);
+                                                let resp_body = format!("{{\"approved\":{},\"fraud_score\":{:.1}}}", approved, score);
+                                                (format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", resp_body.len(), resp_body), 200)
                                             } else {
-                                                Level::Warn
-                                            },
-                                            Category::Request,
-                                            "vectorize",
-                                            vectorize_timer,
-                                            format_args!(
-                                                "fd={} result={}",
-                                                fd,
-                                                if maybe_vec.is_some() {
-                                                    "ok"
-                                                } else {
-                                                    "invalid_input"
-                                                }
-                                            ),
-                                        );
-
-                                        if let Some(vec) = maybe_vec {
-                                            let knn_timer = logging::timer_start();
-                                            let (approved, score) =
-                                                index.search(&vec, dataset.records);
-                                            logging::log_timing(
-                                                Level::Debug,
-                                                Category::Request,
-                                                "knn_search",
-                                                knn_timer,
-                                                format_args!(
-                                                    "fd={} approved={} fraud_score={:.1}",
-                                                    fd, approved, score
-                                                ),
-                                            );
-
-                                            let build_response_timer = logging::timer_start();
-                                            let resp_body = format!(
-                                                "{{\"approved\":{},\"fraud_score\":{:.1}}}",
-                                                approved, score
-                                            );
-                                            logging::log(
-                                                Level::Debug,
-                                                Category::Request,
-                                                &format!(
-                                                    "Fraud score response: approved={}, score={:.1}",
-                                                    approved, score
-                                                ),
-                                            );
-                                            let response = format!(
-                                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                                                resp_body.len(),
-                                                resp_body
-                                            );
-                                            logging::log_timing(
-                                                Level::Debug,
-                                                Category::Request,
-                                                "build_fraud_response",
-                                                build_response_timer,
-                                                format_args!(
-                                                    "fd={} status=200 body_bytes={}",
-                                                    fd,
-                                                    resp_body.len()
-                                                ),
-                                            );
-                                            (response, 200)
+                                                ("HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string(), 422)
+                                            }
                                         } else {
-                                            logging::log(
-                                                Level::Debug,
-                                                Category::Request,
-                                                "Vectorization failed",
-                                            );
-                                            (
-                                                "HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n".to_string(),
-                                                422,
-                                            )
+                                            ("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string(), 400)
                                         }
-                                    }
-                                    None => {
-                                        logging::log(
-                                            Level::Debug,
-                                            Category::Request,
-                                            "JSON parsing failed",
-                                        );
-                                        (
-                                            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
-                                                .to_string(),
-                                            400,
-                                        )
-                                    }
-                                };
-                                let b = response.as_bytes();
-                                let len = std::cmp::min(b.len(), BUF_SIZE);
-                                write_buf[..len].copy_from_slice(&b[..len]);
-                                if let Some(started_at) = request_started_at.take() {
-                                    pending_write_timing =
-                                        Some((fd, started_at, "fraud-score", status_code));
+                                    } else {
+                                        ("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string(), 503)
+                                    };
+                                    
+                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                    let b = resp_str.as_bytes();
+                                    let len = std::cmp::min(b.len(), BUF_SIZE);
+                                    w_buf[..len].copy_from_slice(&b[..len]);
+                                    push_write(&mut ring, client_fd, w_buf.as_ptr(), len);
+                                    conns[client_fd as usize] = ConnState::Writing {
+                                        buf: w_buf,
+                                        len,
+                                        written: 0,
+                                        started_at,
+                                        route: "fraud-score",
+                                        status,
+                                    };
                                 }
-                                push_write(&mut ring, fd, write_buf.as_ptr(), len);
-                            } else {
-                                logging::log(
-                                    Level::Warn,
-                                    Category::Request,
-                                    "FraudScore endpoint called but state not ready",
-                                );
-                                let resp: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-                                write_buf[..resp.len()].copy_from_slice(resp);
-                                if let Some(started_at) = request_started_at.take() {
-                                    pending_write_timing =
-                                        Some((fd, started_at, "fraud-score", 503));
+                                HttpRoute::NotFound => {
+                                    let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
+                                    w_buf[..resp.len()].copy_from_slice(resp);
+                                    push_write(&mut ring, client_fd, w_buf.as_ptr(), resp.len());
+                                    conns[client_fd as usize] = ConnState::Writing {
+                                        buf: w_buf,
+                                        len: resp.len(),
+                                        written: 0,
+                                        started_at,
+                                        route: "not-found",
+                                        status: 404,
+                                    };
                                 }
-                                push_write(&mut ring, fd, write_buf.as_ptr(), resp.len());
                             }
                         }
-                        HttpRoute::NotFound => {
-                            logging::log(Level::Info, Category::Request, "Route: NotFound (404)");
-                            let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                            write_buf[..resp.len()].copy_from_slice(resp);
-                            if let Some(started_at) = request_started_at.take() {
-                                pending_write_timing = Some((fd, started_at, "not-found", 404));
-                            }
-                            push_write(&mut ring, fd, write_buf.as_ptr(), resp.len());
-                        }
-                    }
-                } else {
-                    logging::log(
-                        Level::Debug,
-                        Category::IoUring,
-                        "Read failed or connection closed",
-                    );
-                    if let Some(started_at) = request_started_at.take() {
-                        logging::log_timing(
-                            Level::Warn,
-                            Category::Request,
-                            "request_lifecycle",
-                            started_at,
-                            format_args!("fd={} route=read-failed status=closed", fd),
-                        );
-                    }
-                    pending_write_timing = None;
-                    push_close(&mut ring, fd);
-                }
-            } else if (user_data & 0x2) == 2 {
-                // Write
-                let fd = (user_data >> 2) as RawFd;
-                if let Some((pending_fd, started_at, route, status)) = pending_write_timing.take() {
-                    if pending_fd == fd {
-                        logging::log_timing(
-                            Level::Info,
-                            Category::Request,
-                            "request_lifecycle",
-                            started_at,
-                            format_args!("fd={} route={} status={}", fd, route, status),
-                        );
                     } else {
-                        pending_write_timing = Some((pending_fd, started_at, route, status));
+                        // Read failed or EOF
+                        if (fd as usize) < MAX_FDS {
+                            if let ConnState::Reading { started_at, .. } = mem::replace(&mut conns[fd as usize], ConnState::Idle) {
+                                api_log_timing!(Level::Warn, Category::Request, "request_lifecycle", started_at, "fd={} route=read-failed status=closed", fd);
+                            }
+                        }
+                        push_close(&mut ring, fd);
+                        conns[fd as usize] = ConnState::Closing;
                     }
                 }
-                push_close(&mut ring, fd);
-            } else if (user_data & 0x4) == 4 {
-                // Close
-                let fd = (user_data >> 3) as RawFd;
-                if let Some((pending_fd, _, _, _)) = pending_write_timing {
-                    if pending_fd == fd {
-                        pending_write_timing = None;
+                2 => { // Write
+                    if res > 0 {
+                        if (fd as usize) < MAX_FDS {
+                            if let ConnState::Writing { buf, len, mut written, started_at, route, status } = mem::replace(&mut conns[fd as usize], ConnState::Idle) {
+                                written += res as usize;
+                                if written < len {
+                                    push_write_at(&mut ring, fd, buf.as_ptr(), len, written);
+                                    conns[fd as usize] = ConnState::Writing { buf, len, written, started_at, route, status };
+                                } else {
+                                    api_log_timing!(Level::Info, Category::Request, "request_lifecycle", started_at, "fd={} route={} status={}", fd, route, status);
+                                    push_close(&mut ring, fd);
+                                    conns[fd as usize] = ConnState::Closing;
+                                }
+                            }
+                        }
+                    } else {
+                        push_close(&mut ring, fd);
+                        conns[fd as usize] = ConnState::Closing;
                     }
                 }
-                request_started_at = None;
-                // After closing, we are ready for the next client
-                push_recvmsg(&mut ring, uds_fd, &mut msg);
+                3 => { // Close
+                    if (fd as usize) < MAX_FDS {
+                        conns[fd as usize] = ConnState::Idle;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -430,7 +307,7 @@ fn push_recvmsg(ring: &mut IoUring, fd: RawFd, msg: *mut libc::msghdr) {
     }
     let sqe = opcode::RecvMsg::new(types::Fd(fd), msg)
         .build()
-        .user_data(0);
+        .user_data(0); // OP 0, FD 0
     unsafe {
         ring.submission().push(&sqe).ok();
     }
@@ -439,7 +316,16 @@ fn push_recvmsg(ring: &mut IoUring, fd: RawFd, msg: *mut libc::msghdr) {
 fn push_read(ring: &mut IoUring, fd: RawFd, buf: *mut u8, len: usize) {
     let sqe = opcode::Read::new(types::Fd(fd), buf, len as u32)
         .build()
-        .user_data(((fd as u64) << 1) | 1);
+        .user_data(((fd as u64) << 4) | 1);
+    unsafe {
+        ring.submission().push(&sqe).ok();
+    }
+}
+
+fn push_read_at(ring: &mut IoUring, fd: RawFd, buf: *mut u8, total_len: usize, pos: usize) {
+    let sqe = opcode::Read::new(types::Fd(fd), unsafe { buf.add(pos) }, (total_len - pos) as u32)
+        .build()
+        .user_data(((fd as u64) << 4) | 1);
     unsafe {
         ring.submission().push(&sqe).ok();
     }
@@ -448,7 +334,16 @@ fn push_read(ring: &mut IoUring, fd: RawFd, buf: *mut u8, len: usize) {
 fn push_write(ring: &mut IoUring, fd: RawFd, buf: *const u8, len: usize) {
     let sqe = opcode::Write::new(types::Fd(fd), buf, len as u32)
         .build()
-        .user_data(((fd as u64) << 2) | 2);
+        .user_data(((fd as u64) << 4) | 2);
+    unsafe {
+        ring.submission().push(&sqe).ok();
+    }
+}
+
+fn push_write_at(ring: &mut IoUring, fd: RawFd, buf: *const u8, total_len: usize, written: usize) {
+    let sqe = opcode::Write::new(types::Fd(fd), unsafe { buf.add(written) }, (total_len - written) as u32)
+        .build()
+        .user_data(((fd as u64) << 4) | 2);
     unsafe {
         ring.submission().push(&sqe).ok();
     }
@@ -457,7 +352,7 @@ fn push_write(ring: &mut IoUring, fd: RawFd, buf: *const u8, len: usize) {
 fn push_close(ring: &mut IoUring, fd: RawFd) {
     let sqe = opcode::Close::new(types::Fd(fd))
         .build()
-        .user_data(((fd as u64) << 3) | 4);
+        .user_data(((fd as u64) << 4) | 3);
     unsafe {
         ring.submission().push(&sqe).ok();
     }

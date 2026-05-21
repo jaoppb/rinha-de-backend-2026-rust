@@ -40,10 +40,10 @@ By using `mmap`, the OS maps the file directly into the process's virtual memory
 
 The API evaluates each request by:
 1. Vectorizing the transaction into the same 14-feature space as the dataset.
-2. Ranking IVF centroids with squared Euclidean distance.
+2. Ranking IVF centroids with **Manhattan distance (L1 norm)**.
 3. Inspecting the nearest 10 clusters and taking a distance-weighted vote from the 7 nearest records.
 
-This keeps the scoring logic aligned with the index builder while making close neighbors count more than distant ones.
+The project uses Manhattan distance instead of Euclidean distance as it provides a significant performance boost during the search phase while remaining permitted by the competition's detection rules. This keeps the scoring logic aligned with the index builder while making close neighbors count more than distant ones.
 
 ### Health Checks
 The API is considered "ready" only after all four binary files have been successfully mapped and the IVF index is initialized. HAProxy monitors the `/ready` endpoint to ensure traffic is only routed to fully initialized instances.
