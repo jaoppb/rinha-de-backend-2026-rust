@@ -140,45 +140,49 @@ fn main() -> std::io::Result<()> {
             }
         }
 
+        // Prioritize UDS processing: drain it completely before processing other events
+        loop {
+            unsafe {
+                msg.msg_controllen = cmsg_buf.len() as _;
+                let res = libc::recvmsg(uds_fd, &mut msg, 0);
+                if res < 0 {
+                    break;
+                }
+
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                if !cmsg.is_null()
+                    && (*cmsg).cmsg_level == libc::SOL_SOCKET
+                    && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+                {
+                    let client_fd = *(libc::CMSG_DATA(cmsg) as *mut libc::c_int);
+                    if (client_fd as usize) < MAX_FDS {
+                        let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
+                        libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
+                        poll.registry().register(
+                            &mut SourceFd(&client_fd),
+                            Token(client_fd as usize),
+                            Interest::READABLE,
+                        ).ok();
+
+                        conns[client_fd as usize] = ConnState::Reading {
+                            buf: Box::new([0u8; BUF_SIZE]),
+                            pos: 0,
+                            started_at: crate::logging::timer_start(),
+                        };
+                    } else {
+                        libc::close(client_fd);
+                    }
+                }
+            }
+        }
+
         for event in events.iter() {
             let token = event.token();
 
             if token == UDS_TOKEN {
-                loop {
-                    unsafe {
-                        msg.msg_controllen = cmsg_buf.len() as _;
-                        let res = libc::recvmsg(uds_fd, &mut msg, 0);
-                        if res < 0 {
-                            break;
-                        }
-
-                        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                        if !cmsg.is_null()
-                            && (*cmsg).cmsg_level == libc::SOL_SOCKET
-                            && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-                        {
-                            let client_fd = *(libc::CMSG_DATA(cmsg) as *mut libc::c_int);
-                            if (client_fd as usize) < MAX_FDS {
-                                let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
-                                libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-
-                                poll.registry().register(
-                                    &mut SourceFd(&client_fd),
-                                    Token(client_fd as usize),
-                                    Interest::READABLE,
-                                ).ok();
-
-                                conns[client_fd as usize] = ConnState::Reading {
-                                    buf: Box::new([0u8; BUF_SIZE]),
-                                    pos: 0,
-                                    started_at: crate::logging::timer_start(),
-                                };
-                            } else {
-                                libc::close(client_fd);
-                            }
-                        }
-                    }
-                }
+                // Handled above for priority
+                continue;
             } else {
                 let client_fd = token.0 as RawFd;
                 

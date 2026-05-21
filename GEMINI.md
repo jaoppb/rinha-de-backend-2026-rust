@@ -6,13 +6,22 @@ High-performance Rust backend entry for the Rinha de Backend 2026 competition. T
 
 The system uses a highly specialized architecture to minimize overhead:
 
--   **Asynchronous I/O:** Powered by `io_uring` for all network and file operations (no standard `tokio` or `async-std`).
--   **FD-Level Load Balancing:** The custom load balancer (`lb/`) accepts client connections and hands off the file descriptors to API workers via Unix Domain Sockets using `SCM_RIGHTS`. This avoids proxying overhead.
--   **Zero-Copy Data Access:** The `indexer/` pre-processes JSON data into 64-byte aligned binary records. The `api/` uses `mmap` to access these records directly from the OS page cache.
--   **Custom Parsers:** To eliminate generic library overhead, the project uses hand-rolled HTTP (`api/src/http_parser.rs`) and JSON (`api/src/json_parser.rs`) parsers.
--   **Search Optimization:** KNN search for fraud detection is implemented using an Inverted File (IVF) index with Manhattan distance, optimized for cache efficiency (`api/src/knn.rs`).
+- **Asynchronous I/O:** Powered by `epoll` (via `mio`) for all network and file operations. Note: `io_uring` was the original target but is currently disabled due to environment-specific security constraints.
+- **FD-Level Load Balancing:** The custom load balancer (`lb/`) accepts client connections and hands off the file descriptors to API workers via Unix Domain Sockets using `SCM_RIGHTS`. This avoids proxying overhead.
+- **Zero-Copy Data Access:** The `indexer/` pre-processes JSON data into 64-byte aligned binary records. The `api/` uses `mmap` to access these records directly from the OS page cache.
+- **Custom Parsers:** To eliminate generic library overhead, the project uses hand-rolled HTTP (`api/src/http_parser.rs`) and JSON (`api/src/json_parser.rs`) parsers.
+- **Search Optimization:** KNN search for fraud detection is implemented using an Inverted File (IVF) index with Manhattan distance, optimized for cache efficiency (`api/src/knn.rs`).
+
+## Performance Baselines
+
+### 2026-05-21 Benchmark
+- **Throughput:** 450.05 req/s
+- **p99 Latency:** 268.66 ms
+- **Success Rate:** 43.62%
+- **Primary Bottleneck:** API event loop blocking on synchronous KNN searches, causing UDS buffer overflows (503 errors).
 
 ## Key Components
+
 
 -   `api/`: The main worker process. It receives connections from the LB, parses requests, performs KNN searches, and serves responses.
     -   `build.rs`: Bakes static lookup tables from `resources/*.json` directly into the binary.

@@ -79,8 +79,56 @@ impl IvfIndex {
 
 #[inline(always)]
 fn manhattan_distance(v1: &[f32; 14], v2: &[f32; 14], limit: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { manhattan_distance_avx2(v1, v2, limit) };
+        }
+    }
+    
+    manhattan_distance_scalar(v1, v2, limit)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn manhattan_distance_avx2(v1: &[f32; 14], v2: &[f32; 14], limit: f32) -> f32 {
+    use std::arch::x86_64::*;
+
+    // Load first 8 floats
+    let a8 = _mm256_loadu_ps(v1.as_ptr());
+    let b8 = _mm256_loadu_ps(v2.as_ptr());
+    
+    // abs(a - b)
+    let diff8 = _mm256_sub_ps(a8, b8);
+    // Use bitwise AND with 0x7FFFFFFF to get absolute value
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    let abs8 = _mm256_and_ps(diff8, abs_mask);
+    
+    // Horizontal sum of the 8 floats
+    // This is slightly faster than extracting individually
+    let mut sum8_buf = [0.0f32; 8];
+    _mm256_storeu_ps(sum8_buf.as_mut_ptr(), abs8);
+    let mut sum = sum8_buf[0] + sum8_buf[1] + sum8_buf[2] + sum8_buf[3] +
+                  sum8_buf[4] + sum8_buf[5] + sum8_buf[6] + sum8_buf[7];
+
+    if sum >= limit {
+        return sum;
+    }
+
+    // Remaining 6 floats (14 - 8 = 6)
+    for i in 8..14 {
+        sum += (v1[i] - v2[i]).abs();
+        if sum >= limit {
+            return sum;
+        }
+    }
+
+    sum
+}
+
+#[inline(always)]
+fn manhattan_distance_scalar(v1: &[f32; 14], v2: &[f32; 14], limit: f32) -> f32 {
     let mut sum = 0.0;
-    // Unrolling or encouraging auto-vec by using chunks or fixed sizes
     for i in 0..14 {
         sum += (v1[i] - v2[i]).abs();
         if sum >= limit {
