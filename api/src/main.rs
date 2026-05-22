@@ -196,7 +196,9 @@ fn main() -> std::io::Result<()> {
 
                             if res > 0 {
                                 pos += res as usize;
+                                let http_timer = crate::logging::timer_start();
                                 let (route, _) = parse_http_request(&buf[..pos]);
+                                crate::api_log_timing!(Level::Info, Category::Request, "http_parse", http_timer, "fd={}", client_fd);
                                 match route {
                                     HttpRoute::Incomplete => {
                                         if pos == BUF_SIZE {
@@ -228,10 +230,19 @@ fn main() -> std::io::Result<()> {
                                     }
                                     HttpRoute::FraudScore(body_bytes) => {
                                         if let Some(state) = &app_state {
+                                            let json_timer = crate::logging::timer_start();
                                             let tx = if body_bytes.is_empty() { None } else { parse_json_payload(body_bytes) };
+                                            crate::api_log_timing!(Level::Info, Category::Request, "json_parse", json_timer, "fd={}", client_fd);
+
                                             if let Some(tx) = tx {
-                                                if let Some(vec) = vectorize(&tx, &state.lookups) {
+                                                let vec_timer = crate::logging::timer_start();
+                                                let vec_opt = vectorize(&tx, &state.lookups);
+                                                crate::api_log_timing!(Level::Info, Category::Request, "vectorize", vec_timer, "fd={}", client_fd);
+
+                                                if let Some(vec) = vec_opt {
+                                                    let knn_timer = crate::logging::timer_start();
                                                     let (approved, score) = state.index.search(&vec, state.dataset.records);
+                                                    crate::api_log_timing!(Level::Info, Category::Request, "knn_search", knn_timer, "fd={}", client_fd);
                                                     
                                                     let mut w_buf = Box::new([0u8; BUF_SIZE]);
                                                     let mut pos = 0;
