@@ -13,13 +13,11 @@ struct JsonRecord {
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct Record {
-    pub vector: [f32; 16],  // 64 bytes
-    pub label: u8,          // 1 byte
-    pub _padding: [u8; 63], // 63 bytes -> Total 128 bytes (aligned 64)
+    pub vector: [f32; 16],  // 64 bytes, label stored in vector[15]
 }
 
-const N_CENTROIDS: usize = 256;
-const N_ITERATIONS: usize = 5;
+const N_CENTROIDS: usize = 2048;
+const N_ITERATIONS: usize = 10;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -58,20 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Successfully loaded {} records", records.len());
     std::fs::create_dir_all(output_dir)?;
 
-    // 1. Write dataset.bin
-    let dataset_path = Path::new(output_dir).join("dataset.bin");
-    let mut f = File::create(&dataset_path)?;
-    for record in &records {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (record as *const Record) as *const u8,
-                std::mem::size_of::<Record>(),
-            )
-        };
-        f.write_all(bytes)?;
-    }
-
-    // 2. Build IVF Index
+    // Build IVF Index
     let mut centroids = [[0.0f32; 16]; N_CENTROIDS];
     let stride = (records.len() / N_CENTROIDS).max(1);
     for i in 0..N_CENTROIDS {
@@ -80,7 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut assignments = vec![0u16; records.len()];
-    for _ in 0..N_ITERATIONS {
+    for iter in 0..N_ITERATIONS {
+        println!("K-Means iteration {}/{}...", iter + 1, N_ITERATIONS);
         let mut counts = [0u32; N_CENTROIDS];
         let mut sums = [[0.0f32; 16]; N_CENTROIDS];
 
@@ -96,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             assignments[i] = best_c as u16;
             counts[best_c] += 1;
-            for d in 0..16 {
+            for d in 0..14 { // Only sum feature dimensions
                 sums[best_c][d] += record.vector[d];
             }
         }
@@ -104,12 +90,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..N_CENTROIDS {
             if counts[i] > 0 {
                 let inv = 1.0 / counts[i] as f32;
-                for d in 0..16 {
+                for d in 0..14 {
                     centroids[i][d] = sums[i][d] * inv;
                 }
+                centroids[i][14] = 0.0;
+                centroids[i][15] = 0.0;
             } else {
-                let idx = (i * stride).min(records.len() - 1);
+                let idx = (iter * i + i) % records.len();
                 centroids[i] = records[idx].vector;
+                centroids[i][15] = 0.0; // Clear label from centroid
             }
         }
     }
@@ -124,20 +113,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         offsets[i + 1] = offsets[i] + counts[i];
     }
 
-    let mut indices = vec![0u32; records.len()];
+    // Reorder records by cluster
+    println!("Reordering records for contiguous access...");
+    let mut reordered_records = vec![Record { vector: [0.0; 16] }; records.len()];
     let mut current_pos = offsets;
     for (i, &c_idx) in assignments.iter().enumerate() {
         let pos = current_pos[c_idx as usize];
-        indices[pos as usize] = i as u32;
+        reordered_records[pos as usize] = records[i];
         current_pos[c_idx as usize] += 1;
     }
 
-    // 3. Write Index Artifacts
+    // 1. Write reordered dataset.bin
+    println!("Writing reordered dataset.bin...");
+    let dataset_path = Path::new(output_dir).join("dataset.bin");
+    let mut f = File::create(&dataset_path)?;
+    for record in &reordered_records {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (record as *const Record) as *const u8,
+                std::mem::size_of::<Record>(),
+            )
+        };
+        f.write_all(bytes)?;
+    }
+
+    // 2. Write Index Artifacts
+    println!("Writing index artifacts...");
     File::create(Path::new(output_dir).join("centroids.bin"))?
         .write_all(unsafe { std::slice::from_raw_parts(centroids.as_ptr() as *const u8, std::mem::size_of_val(&centroids)) })?;
-
-    File::create(Path::new(output_dir).join("indices.bin"))?
-        .write_all(unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4) })?;
 
     File::create(Path::new(output_dir).join("offsets.bin"))?
         .write_all(unsafe { std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 4) })?;
@@ -149,17 +152,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn convert_record(jr: JsonRecord) -> Record {
     let mut v = [0.0f32; 16];
     v[..14].copy_from_slice(&jr.vector);
+    v[15] = if jr.label == "fraud" { 1.0 } else { 0.0 };
     Record {
         vector: v,
-        label: if jr.label == "fraud" { 1 } else { 0 },
-        _padding: [0; 63],
     }
 }
 
 fn manhattan_distance(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
     let mut sum = 0.0;
-    for i in 0..16 {
+    for i in 0..14 { // Only use first 14 dimensions for distance
         sum += (v1[i] - v2[i]).abs();
     }
     sum
 }
+

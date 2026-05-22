@@ -68,5 +68,9 @@ pub fn vectorize(tx: &ParsedTransaction, lookups: &LookupData) -> Option<[f32; 1
     // 13. merchant_avg_amount
     vec[13] = clamp(tx.merchant_avg_amount / norm.max_merchant_avg_amount);
 
+    // 14. padding & 15. padding (used for label in Record, must be 0 in query)
+    vec[14] = 0.0;
+    vec[15] = 0.0;
+
     Some(vec)
 }

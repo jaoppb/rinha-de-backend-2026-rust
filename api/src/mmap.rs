@@ -4,9 +4,7 @@ use std::fs::File;
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct Record {
-    pub vector: [f32; 16],  // 64 bytes
-    pub label: u8,          // 1 byte
-    pub _padding: [u8; 63], // 63 bytes -> Total 128 bytes (aligned 64)
+    pub vector: [f32; 16],  // 64 bytes, label stored in vector[15]
 }
 
 #[repr(C)]
@@ -31,10 +29,8 @@ pub struct Dataset {
 
 pub struct IvfData {
     _centroids_mmap: Mmap,
-    _indices_mmap: Mmap,
     _offsets_mmap: Mmap,
     pub centroids: &'static [[f32; 16]],
-    pub indices: &'static [u32],
     pub offsets: &'static [u32],
 }
 
@@ -62,9 +58,6 @@ pub fn load_ivf_data() -> std::io::Result<IvfData> {
     let centroids_file = File::open("/app/data/centroids.bin")?;
     let centroids_mmap = unsafe { Mmap::map(&centroids_file)? };
 
-    let indices_file = File::open("/app/data/indices.bin")?;
-    let indices_mmap = unsafe { Mmap::map(&indices_file)? };
-
     let offsets_file = File::open("/app/data/offsets.bin")?;
     let offsets_mmap = unsafe { Mmap::map(&offsets_file)? };
 
@@ -75,23 +68,18 @@ pub fn load_ivf_data() -> std::io::Result<IvfData> {
         )
     };
 
-    let indices = unsafe {
-        std::slice::from_raw_parts(indices_mmap.as_ptr() as *const u32, indices_mmap.len() / 4)
-    };
-
     let offsets = unsafe {
         std::slice::from_raw_parts(offsets_mmap.as_ptr() as *const u32, offsets_mmap.len() / 4)
     };
 
     Ok(IvfData {
         _centroids_mmap: centroids_mmap,
-        _indices_mmap: indices_mmap,
         _offsets_mmap: offsets_mmap,
         centroids: unsafe { std::mem::transmute(centroids) },
-        indices: unsafe { std::mem::transmute(indices) },
         offsets: unsafe { std::mem::transmute(offsets) },
     })
 }
+
 
 pub fn load_lookups() -> LookupData {
     LookupData {

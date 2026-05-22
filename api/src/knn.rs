@@ -2,8 +2,8 @@ use crate::mmap::{IvfData, Record};
 use std::arch::x86_64::*;
 
 const K: usize = 7;
-const N_CENTROIDS: usize = 256;
-const N_PROBE: usize = 8; // Number of clusters to search
+const N_CENTROIDS: usize = 2048;
+const N_PROBE: usize = 32; // Increased for better accuracy with 2048 centroids
 const SCORE_EPS: f32 = 1e-6;
 const APPROVAL_THRESHOLD: f32 = 0.44;
 
@@ -31,7 +31,6 @@ impl IvfIndex {
     #[target_feature(enable = "avx2")]
     unsafe fn search_avx2(&self, query: &[f32; 16], records: &[Record]) -> (bool, f32) {
         let centroids = self.data.centroids;
-        let indices = self.data.indices;
         let offsets = self.data.offsets;
 
         // 1. Load query once into registers
@@ -40,8 +39,6 @@ impl IvfIndex {
         let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
 
         // 2. Find nearest clusters (probes)
-        // We only need top N_PROBE (8) out of 256. 
-        // Using a fixed-size array and simple insertion sort for top-8.
         let mut best_probes = [(f32::MAX, 0usize); N_PROBE];
         
         for i in 0..N_CENTROIDS {
@@ -62,44 +59,40 @@ impl IvfIndex {
         let mut max_dist = f32::MAX;
 
         for i in 0..N_PROBE {
-            let (p_dist, c_idx) = best_probes[i];
-            // Optimization: if the closest centroid is already further than our current top-k max, 
-            // maybe we can skip? No, because cluster boundary is not hard.
-            // But we can use p_dist as a lower bound? Actually, IVF doesn't guarantee that.
-
+            let (_, c_idx) = best_probes[i];
             let start = offsets[c_idx] as usize;
             let end = offsets[c_idx + 1] as usize;
-            let cluster_indices = &indices[start..end];
+            
+            let cluster_records = &records[start..end];
 
             let mut k = 0;
             // Unroll loop to process 2 records at a time for better ILP
-            while k + 1 < cluster_indices.len() {
-                let idx1 = cluster_indices[k] as usize;
-                let idx2 = cluster_indices[k + 1] as usize;
+            while k + 1 < cluster_records.len() {
+                let r1 = &cluster_records[k];
+                let r2 = &cluster_records[k + 1];
                 
                 // Prefetch ahead
-                if k + 4 < cluster_indices.len() {
-                    let next_idx = cluster_indices[k + 4] as usize;
-                    _mm_prefetch(records[next_idx].vector.as_ptr() as *const i8, _MM_HINT_T0);
+                if k + 8 < cluster_records.len() {
+                    _mm_prefetch(cluster_records[k + 8].vector.as_ptr() as *const i8, _MM_HINT_T0);
                 }
 
-                let dist1 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &records[idx1].vector);
-                let dist2 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &records[idx2].vector);
+                let dist1 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &r1.vector);
+                let dist2 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &r2.vector);
 
                 if dist1 < max_dist {
-                    max_dist = update_top_k(&mut top_k, dist1, records[idx1].label);
+                    max_dist = update_top_k(&mut top_k, dist1, r1.vector[15] as u8);
                 }
                 if dist2 < max_dist {
-                    max_dist = update_top_k(&mut top_k, dist2, records[idx2].label);
+                    max_dist = update_top_k(&mut top_k, dist2, r2.vector[15] as u8);
                 }
                 k += 2;
             }
             // Handle remaining
-            if k < cluster_indices.len() {
-                let idx = cluster_indices[k] as usize;
-                let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &records[idx].vector);
+            if k < cluster_records.len() {
+                let r = &cluster_records[k];
+                let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &r.vector);
                 if dist < max_dist {
-                    max_dist = update_top_k(&mut top_k, dist, records[idx].label);
+                    max_dist = update_top_k(&mut top_k, dist, r.vector[15] as u8);
                 }
             }
         }
@@ -116,8 +109,20 @@ impl IvfIndex {
         let abs_low = _mm256_and_ps(_mm256_sub_ps(q_low, b_low), abs_mask);
         let abs_high = _mm256_and_ps(_mm256_sub_ps(q_high, b_high), abs_mask);
         
+        // Horizontal sum of first 14 dimensions. 
+        // dimension 14 and 15 should be 0 in query. 
+        // In Record, dimension 15 is label, dimension 14 is 0.
+        // So we sum 16 dimensions and it will be (sum of 14) + |0-0| + |0-label| = (sum of 14) + label.
+        // To be exact, we should mask out dimension 14 and 15.
+        
         let sum_vec = _mm256_add_ps(abs_low, abs_high);
         
+        // Mask out last 2 elements of high part (index 14 and 15)
+        // This is important because vector[15] is the label (0 or 1).
+        let mask_high = _mm256_castsi256_ps(_mm256_set_epi32(0, 0, -1, -1, -1, -1, -1, -1));
+        let masked_high = _mm256_and_ps(abs_high, mask_high);
+        let sum_vec = _mm256_add_ps(abs_low, masked_high);
+
         // Horizontal sum
         let x128_low = _mm256_castps256_ps128(sum_vec);
         let x128_high = _mm256_extractf128_ps(sum_vec, 1);
@@ -133,7 +138,6 @@ impl IvfIndex {
 
     fn search_scalar(&self, query: &[f32; 16], records: &[Record]) -> (bool, f32) {
         let centroids = self.data.centroids;
-        let indices = self.data.indices;
         let offsets = self.data.offsets;
 
         let mut best_probes = [(f32::MAX, 0usize); N_PROBE];
@@ -157,12 +161,11 @@ impl IvfIndex {
             let start = offsets[c_idx] as usize;
             let end = offsets[c_idx + 1] as usize;
 
-            for &idx in &indices[start..end] {
-                let record = &records[idx as usize];
+            for record in &records[start..end] {
                 let dist = manhattan_distance_scalar(query, &record.vector, max_dist);
 
                 if dist < max_dist {
-                    max_dist = update_top_k(&mut top_k, dist, record.label);
+                    max_dist = update_top_k(&mut top_k, dist, record.vector[15] as u8);
                 }
             }
         }
@@ -204,7 +207,7 @@ fn update_top_k(top_k: &mut [(f32, u8); K], dist: f32, label: u8) -> f32 {
 #[inline(always)]
 fn manhattan_distance_scalar(v1: &[f32; 16], v2: &[f32; 16], limit: f32) -> f32 {
     let mut sum = 0.0;
-    for i in 0..16 {
+    for i in 0..14 { // Only first 14 dimensions are features
         sum += (v1[i] - v2[i]).abs();
         if sum >= limit {
             return sum;
