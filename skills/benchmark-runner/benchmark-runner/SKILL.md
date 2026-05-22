@@ -9,12 +9,13 @@ This skill automates the execution and data collection of performance benchmarks
 
 ## Workflow
 
-1. **Build with Verbose Logging**: Execute `make build-release-verbose` to compile the API and Load Balancer with the `verbose-logging` feature and full dataset.
-2. **Run Monitor**: Execute `make monitor` to start the environment, wait for readiness, run tests, and collect statistics.
-3. **Collect Data**:
-    - Capture the full output of the `make monitor` command.
-    - Review `test_stats.log` for granular operation-level timing statistics.
-    - Focus on latency metrics (p99) from k6 output and `avg_us` per operation from `test_stats.log`.
+1. **Baseline Run (Non-Verbose)**: Execute `make build-release && make monitor` to measure raw performance without logging overhead.
+2. **Analysis Run (Verbose)**: Execute `make build-release-verbose && make monitor` to collect granular operation-level timing statistics.
+3. **Automated Suite**: Alternatively, use `scripts/benchmark_suite.sh` to run both sequentially and aggregate results.
+4. **Collect Data**:
+    - Capture the full output of the `make monitor` command or `benchmark_suite.sh`.
+    - Review `test_stats.log` (generated in verbose mode) for operation-level timing.
+    - Focus on latency metrics (p99) from k6 output and `avg_us` per operation.
 
 ## Data Collection Pattern
 
