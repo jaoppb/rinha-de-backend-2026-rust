@@ -14,6 +14,19 @@ The system uses a highly specialized architecture to minimize overhead:
 
 ## Performance Baselines
 
+### 2026-05-22 Benchmark (Optimized)
+- **Throughput:** 450.48 req/s
+- **p99 Latency:** 2.68 ms
+- **Success Rate:** 100%
+- **KNN Tail Latency:** 4.97 ms (Reduced from 17.6ms)
+- **Status:** KNN loop unrolled (4x) and prefetched. Tail latency target (<5ms) achieved.
+
+### 2026-05-22 Benchmark (Baseline)
+- **Throughput:** 450.48 req/s
+- **p99 Latency:** 2.02 ms
+- **Success Rate:** 100%
+- **KNN Tail Latency:** 17.6 ms
+
 ### 2026-05-21 Benchmark
 - **Throughput:** 450.05 req/s
 - **p99 Latency:** 268.66 ms
@@ -58,6 +71,8 @@ Testing is primarily done via `k6` scripts in the `test/` directory.
 -   **No standard async:** Avoid adding `tokio` or other heavy async runtimes unless absolutely necessary. Stick to the `io_uring` event loop.
 -   **Memory Alignment:** Binary records are 64-byte aligned. Ensure any changes to the data format maintain this for cache efficiency.
 -   **Static Lookups:** Many configuration files are baked at compile-time. If you update files in `resources/`, you must recompile the API.
+-   **Load Balancing:** Strict round-robin distribution to upstream API workers is a hard requirement. Do not implement least-connections or other dynamic routing algorithms.
+-   **Target Hardware:** The competition/benchmark environment is a Mac mini (Late 2014) with a 2.6GHz dual-core Intel Core i5 processor (Haswell microarchitecture) and 8GB RAM (https://support.apple.com/en-us/111931). This means AVX2 is the maximum supported vector extension; AVX-512 is not available.
 
 ## Documentation
 

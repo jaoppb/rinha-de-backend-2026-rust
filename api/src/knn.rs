@@ -41,17 +41,31 @@ impl IvfIndex {
         // 2. Find nearest clusters (probes)
         let mut best_probes = [(f32::MAX, 0usize); N_PROBE];
         
-        for i in 0..N_CENTROIDS {
-            let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i]);
-            
-            if dist < best_probes[N_PROBE - 1].0 {
-                let mut pos = N_PROBE - 1;
-                while pos > 0 && dist < best_probes[pos - 1].0 {
-                    best_probes[pos] = best_probes[pos - 1];
-                    pos -= 1;
-                }
-                best_probes[pos] = (dist, i);
+        let mut i = 0;
+        // Unroll by 4 for centroid scan
+        while i + 3 < N_CENTROIDS {
+            // Prefetch ahead
+            if i + 8 < N_CENTROIDS {
+                _mm_prefetch(centroids[i + 8].as_ptr() as *const i8, _MM_HINT_T0);
             }
+
+            let d0 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i]);
+            let d1 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i + 1]);
+            let d2 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i + 2]);
+            let d3 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i + 3]);
+
+            self.update_best_probes(&mut best_probes, d0, i);
+            self.update_best_probes(&mut best_probes, d1, i + 1);
+            self.update_best_probes(&mut best_probes, d2, i + 2);
+            self.update_best_probes(&mut best_probes, d3, i + 3);
+            
+            i += 4;
+        }
+        // Handle remaining centroids
+        while i < N_CENTROIDS {
+            let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i]);
+            self.update_best_probes(&mut best_probes, dist, i);
+            i += 1;
         }
 
         // 3. Search nearest records in probes
@@ -66,38 +80,49 @@ impl IvfIndex {
             let cluster_records = &records[start..end];
 
             let mut k = 0;
-            // Unroll loop to process 2 records at a time for better ILP
-            while k + 1 < cluster_records.len() {
-                let r1 = &cluster_records[k];
-                let r2 = &cluster_records[k + 1];
-                
+            // Unroll by 4 for data scan
+            while k + 3 < cluster_records.len() {
                 // Prefetch ahead
-                if k + 8 < cluster_records.len() {
-                    _mm_prefetch(cluster_records[k + 8].vector.as_ptr() as *const i8, _MM_HINT_T0);
+                if k + 12 < cluster_records.len() {
+                    _mm_prefetch(cluster_records[k + 12].vector.as_ptr() as *const i8, _MM_HINT_T0);
                 }
 
-                let dist1 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &r1.vector);
-                let dist2 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &r2.vector);
+                let d0 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &cluster_records[k].vector);
+                let d1 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &cluster_records[k + 1].vector);
+                let d2 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &cluster_records[k + 2].vector);
+                let d3 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &cluster_records[k + 3].vector);
 
-                if dist1 < max_dist {
-                    max_dist = update_top_k(&mut top_k, dist1, r1.vector[15] as u8);
-                }
-                if dist2 < max_dist {
-                    max_dist = update_top_k(&mut top_k, dist2, r2.vector[15] as u8);
-                }
-                k += 2;
+                if d0 < max_dist { max_dist = update_top_k(&mut top_k, d0, cluster_records[k].vector[15] as u8); }
+                if d1 < max_dist { max_dist = update_top_k(&mut top_k, d1, cluster_records[k + 1].vector[15] as u8); }
+                if d2 < max_dist { max_dist = update_top_k(&mut top_k, d2, cluster_records[k + 2].vector[15] as u8); }
+                if d3 < max_dist { max_dist = update_top_k(&mut top_k, d3, cluster_records[k + 3].vector[15] as u8); }
+                
+                k += 4;
             }
             // Handle remaining
-            if k < cluster_records.len() {
+            while k < cluster_records.len() {
                 let r = &cluster_records[k];
                 let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &r.vector);
                 if dist < max_dist {
                     max_dist = update_top_k(&mut top_k, dist, r.vector[15] as u8);
                 }
+                k += 1;
             }
         }
 
         self.calculate_fraud_score(top_k)
+    }
+
+    #[inline(always)]
+    fn update_best_probes(&self, best_probes: &mut [(f32, usize); N_PROBE], dist: f32, idx: usize) {
+        if dist < best_probes[N_PROBE - 1].0 {
+            let mut pos = N_PROBE - 1;
+            while pos > 0 && dist < best_probes[pos - 1].0 {
+                best_probes[pos] = best_probes[pos - 1];
+                pos -= 1;
+            }
+            best_probes[pos] = (dist, idx);
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
