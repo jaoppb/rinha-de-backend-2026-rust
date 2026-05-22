@@ -112,6 +112,9 @@ fn main() -> std::io::Result<()> {
 
     let mut app_state: Option<AppState> = None;
     let mut conns: Vec<ConnState> = (0..MAX_FDS).map(|_| ConnState::Idle).collect();
+    let mut free_bufs: Vec<Box<[u8; BUF_SIZE]>> = (0..MAX_FDS * 2)
+        .map(|_| Box::new([0u8; BUF_SIZE]))
+        .collect();
 
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     let mut iov_base = [0u8; 1];
@@ -166,7 +169,7 @@ fn main() -> std::io::Result<()> {
                         ).ok();
 
                         conns[client_fd as usize] = ConnState::Reading {
-                            buf: Box::new([0u8; BUF_SIZE]),
+                            buf: free_bufs.pop().unwrap_or_else(|| Box::new([0u8; BUF_SIZE])),
                             pos: 0,
                             started_at: crate::logging::timer_start(),
                         };
@@ -203,9 +206,11 @@ fn main() -> std::io::Result<()> {
                                     HttpRoute::Incomplete => {
                                         if pos == BUF_SIZE {
                                             should_close = true;
+                                            free_bufs.push(buf);
                                             break;
                                         }
-                                        continue;
+                                        conns[client_fd as usize] = ConnState::Reading { buf, pos, started_at };
+                                        break;
                                     }
                                     HttpRoute::Ready => {
                                         let is_ready = app_state.is_some();
@@ -214,12 +219,11 @@ fn main() -> std::io::Result<()> {
                                         } else {
                                             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
                                         };
-                                        let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                        w_buf[..resp.len()].copy_from_slice(resp);
+                                        buf[..resp.len()].copy_from_slice(resp);
                                         
                                         poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
                                         conns[client_fd as usize] = ConnState::Writing {
-                                            buf: w_buf,
+                                            buf,
                                             len: resp.len(),
                                             written: 0,
                                             started_at,
@@ -244,7 +248,6 @@ fn main() -> std::io::Result<()> {
                                                     let (approved, score) = state.index.search(&vec, state.dataset.records);
                                                     crate::api_log_timing!(Level::Info, Category::Request, "knn_search", knn_timer, "fd={}", client_fd);
                                                     
-                                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
                                                     let mut pos = 0;
                                                     
                                                     // Construct JSON body manually to avoid format!
@@ -282,23 +285,42 @@ fn main() -> std::io::Result<()> {
                                                     
                                                     // Construct HTTP response
                                                     let h1 = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
-                                                    w_buf[pos..pos+h1.len()].copy_from_slice(h1);
+                                                    buf[pos..pos+h1.len()].copy_from_slice(h1);
                                                     pos += h1.len();
                                                     
-                                                    let len_str = bp.to_string(); // small allocation, but let's keep it for now as bp is small
-                                                    w_buf[pos..pos+len_str.len()].copy_from_slice(len_str.as_bytes());
-                                                    pos += len_str.len();
+                                                    let mut len_buf = [0u8; 8];
+                                                    let mut lp = 0;
+                                                    let mut n = bp;
+                                                    if n == 0 {
+                                                        len_buf[0] = b'0';
+                                                        lp = 1;
+                                                    } else {
+                                                        let mut temp = [0u8; 8];
+                                                        let mut tp = 0;
+                                                        while n > 0 {
+                                                            temp[tp] = b'0' + (n % 10) as u8;
+                                                            n /= 10;
+                                                            tp += 1;
+                                                        }
+                                                        while tp > 0 {
+                                                            tp -= 1;
+                                                            len_buf[lp] = temp[tp];
+                                                            lp += 1;
+                                                        }
+                                                    }
+                                                    buf[pos..pos+lp].copy_from_slice(&len_buf[..lp]);
+                                                    pos += lp;
                                                     
                                                     let h2 = b"\r\n\r\n";
-                                                    w_buf[pos..pos+h2.len()].copy_from_slice(h2);
+                                                    buf[pos..pos+h2.len()].copy_from_slice(h2);
                                                     pos += h2.len();
                                                     
-                                                    w_buf[pos..pos+body.len()].copy_from_slice(body);
+                                                    buf[pos..pos+body.len()].copy_from_slice(body);
                                                     pos += body.len();
 
                                                     poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
                                                     conns[client_fd as usize] = ConnState::Writing {
-                                                        buf: w_buf,
+                                                        buf,
                                                         len: pos,
                                                         written: 0,
                                                         started_at,
@@ -307,11 +329,10 @@ fn main() -> std::io::Result<()> {
                                                     };
                                                 } else {
                                                     let resp = b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
-                                                    let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                                    w_buf[..resp.len()].copy_from_slice(resp);
+                                                    buf[..resp.len()].copy_from_slice(resp);
                                                     poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
                                                     conns[client_fd as usize] = ConnState::Writing {
-                                                        buf: w_buf,
+                                                        buf,
                                                         len: resp.len(),
                                                         written: 0,
                                                         started_at,
@@ -321,11 +342,10 @@ fn main() -> std::io::Result<()> {
                                                 }
                                             } else {
                                                 let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-                                                let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                                w_buf[..resp.len()].copy_from_slice(resp);
+                                                buf[..resp.len()].copy_from_slice(resp);
                                                 poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
                                                 conns[client_fd as usize] = ConnState::Writing {
-                                                    buf: w_buf,
+                                                    buf,
                                                     len: resp.len(),
                                                     written: 0,
                                                     started_at,
@@ -335,11 +355,10 @@ fn main() -> std::io::Result<()> {
                                             }
                                         } else {
                                             let resp = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-                                            let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                            w_buf[..resp.len()].copy_from_slice(resp);
+                                            buf[..resp.len()].copy_from_slice(resp);
                                             poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
                                             conns[client_fd as usize] = ConnState::Writing {
-                                                buf: w_buf,
+                                                buf,
                                                 len: resp.len(),
                                                 written: 0,
                                                 started_at,
@@ -352,11 +371,10 @@ fn main() -> std::io::Result<()> {
 
                                     HttpRoute::NotFound => {
                                         let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                                        let mut w_buf = Box::new([0u8; BUF_SIZE]);
-                                        w_buf[..resp.len()].copy_from_slice(resp);
+                                        buf[..resp.len()].copy_from_slice(resp);
                                         poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
                                         conns[client_fd as usize] = ConnState::Writing {
-                                            buf: w_buf,
+                                            buf,
                                             len: resp.len(),
                                             written: 0,
                                             started_at,
@@ -368,6 +386,7 @@ fn main() -> std::io::Result<()> {
                                 }
                             } else if res == 0 {
                                 should_close = true;
+                                free_bufs.push(buf);
                                 break;
                             } else {
                                 let err = std::io::Error::last_os_error();
@@ -375,6 +394,7 @@ fn main() -> std::io::Result<()> {
                                     conns[client_fd as usize] = ConnState::Reading { buf, pos, started_at };
                                 } else {
                                     should_close = true;
+                                    free_bufs.push(buf);
                                 }
                                 break;
                             }
@@ -397,6 +417,7 @@ fn main() -> std::io::Result<()> {
                                 if written == len {
                                     crate::api_log_timing!(Level::Info, Category::Request, "request_lifecycle", started_at, "fd={} route={} status={}", client_fd, route, status);
                                     should_close = true;
+                                    free_bufs.push(buf);
                                     break;
                                 }
                                 continue;
@@ -406,6 +427,7 @@ fn main() -> std::io::Result<()> {
                                     conns[client_fd as usize] = ConnState::Writing { buf, len, written, started_at, route, status };
                                 } else {
                                     should_close = true;
+                                    free_bufs.push(buf);
                                 }
                                 break;
                             }

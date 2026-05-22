@@ -3,7 +3,7 @@ use std::arch::x86_64::*;
 
 const K: usize = 7;
 const N_CENTROIDS: usize = 2048;
-const N_PROBE: usize = 32; // Increased for better accuracy with 2048 centroids
+const N_PROBE: usize = 40; // Balanced for accuracy and latency
 const SCORE_EPS: f32 = 1e-6;
 const APPROVAL_THRESHOLD: f32 = 0.44;
 
@@ -37,22 +37,23 @@ impl IvfIndex {
         let q_low = _mm256_loadu_ps(query.as_ptr());
         let q_high = _mm256_loadu_ps(query.as_ptr().add(8));
         let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+        let mask_high = _mm256_castsi256_ps(_mm256_set_epi32(0, 0, -1, -1, -1, -1, -1, -1));
 
         // 2. Find nearest clusters (probes)
         let mut best_probes = [(f32::MAX, 0usize); N_PROBE];
         
         let mut i = 0;
-        // Unroll by 4 for centroid scan
+        // Unroll by 4 with interleaving for centroid scan
         while i + 3 < N_CENTROIDS {
             // Prefetch ahead
             if i + 8 < N_CENTROIDS {
                 _mm_prefetch(centroids[i + 8].as_ptr() as *const i8, _MM_HINT_T0);
             }
 
-            let d0 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i]);
-            let d1 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i + 1]);
-            let d2 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i + 2]);
-            let d3 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i + 3]);
+            let (d0, d1, d2, d3) = self.dist_avx2_preloaded_x4(
+                q_low, q_high, abs_mask, mask_high,
+                &centroids[i], &centroids[i+1], &centroids[i+2], &centroids[i+3]
+            );
 
             self.update_best_probes(&mut best_probes, d0, i);
             self.update_best_probes(&mut best_probes, d1, i + 1);
@@ -63,7 +64,7 @@ impl IvfIndex {
         }
         // Handle remaining centroids
         while i < N_CENTROIDS {
-            let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &centroids[i]);
+            let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, mask_high, &centroids[i]);
             self.update_best_probes(&mut best_probes, dist, i);
             i += 1;
         }
@@ -80,29 +81,32 @@ impl IvfIndex {
             let cluster_records = &records[start..end];
 
             let mut k = 0;
-            // Unroll by 4 for data scan
+            // Unroll by 4 with interleaving for data scan
             while k + 3 < cluster_records.len() {
                 // Prefetch ahead
                 if k + 12 < cluster_records.len() {
                     _mm_prefetch(cluster_records[k + 12].vector.as_ptr() as *const i8, _MM_HINT_T0);
                 }
 
-                let d0 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &cluster_records[k].vector);
-                let d1 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &cluster_records[k + 1].vector);
-                let d2 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &cluster_records[k + 2].vector);
-                let d3 = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &cluster_records[k + 3].vector);
+                let (d0, d1, d2, d3) = self.dist_avx2_preloaded_x4(
+                    q_low, q_high, abs_mask, mask_high,
+                    &cluster_records[k].vector, 
+                    &cluster_records[k+1].vector, 
+                    &cluster_records[k+2].vector, 
+                    &cluster_records[k+3].vector
+                );
 
                 if d0 < max_dist { max_dist = update_top_k(&mut top_k, d0, cluster_records[k].vector[15] as u8); }
-                if d1 < max_dist { max_dist = update_top_k(&mut top_k, d1, cluster_records[k + 1].vector[15] as u8); }
-                if d2 < max_dist { max_dist = update_top_k(&mut top_k, d2, cluster_records[k + 2].vector[15] as u8); }
-                if d3 < max_dist { max_dist = update_top_k(&mut top_k, d3, cluster_records[k + 3].vector[15] as u8); }
+                if d1 < max_dist { max_dist = update_top_k(&mut top_k, d1, cluster_records[k+1].vector[15] as u8); }
+                if d2 < max_dist { max_dist = update_top_k(&mut top_k, d2, cluster_records[k+2].vector[15] as u8); }
+                if d3 < max_dist { max_dist = update_top_k(&mut top_k, d3, cluster_records[k+3].vector[15] as u8); }
                 
                 k += 4;
             }
             // Handle remaining
             while k < cluster_records.len() {
                 let r = &cluster_records[k];
-                let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, &r.vector);
+                let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, mask_high, &r.vector);
                 if dist < max_dist {
                     max_dist = update_top_k(&mut top_k, dist, r.vector[15] as u8);
                 }
@@ -127,28 +131,71 @@ impl IvfIndex {
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn dist_avx2_preloaded(&self, q_low: __m256, q_high: __m256, abs_mask: __m256, v2: &[f32; 16]) -> f32 {
+    unsafe fn dist_avx2_preloaded(&self, q_low: __m256, q_high: __m256, abs_mask: __m256, mask_high: __m256, v2: &[f32; 16]) -> f32 {
         let b_low = _mm256_loadu_ps(v2.as_ptr());
         let b_high = _mm256_loadu_ps(v2.as_ptr().add(8));
         
         let abs_low = _mm256_and_ps(_mm256_sub_ps(q_low, b_low), abs_mask);
         let abs_high = _mm256_and_ps(_mm256_sub_ps(q_high, b_high), abs_mask);
         
-        // Horizontal sum of first 14 dimensions. 
-        // dimension 14 and 15 should be 0 in query. 
-        // In Record, dimension 15 is label, dimension 14 is 0.
-        // So we sum 16 dimensions and it will be (sum of 14) + |0-0| + |0-label| = (sum of 14) + label.
-        // To be exact, we should mask out dimension 14 and 15.
-        
-        let sum_vec = _mm256_add_ps(abs_low, abs_high);
-        
-        // Mask out last 2 elements of high part (index 14 and 15)
-        // This is important because vector[15] is the label (0 or 1).
-        let mask_high = _mm256_castsi256_ps(_mm256_set_epi32(0, 0, -1, -1, -1, -1, -1, -1));
         let masked_high = _mm256_and_ps(abs_high, mask_high);
         let sum_vec = _mm256_add_ps(abs_low, masked_high);
 
-        // Horizontal sum
+        self.hsum_avx2(sum_vec)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn dist_avx2_preloaded_x4(
+        &self, 
+        q_low: __m256, 
+        q_high: __m256, 
+        abs_mask: __m256,
+        mask_high: __m256,
+        v0: &[f32; 16],
+        v1: &[f32; 16],
+        v2: &[f32; 16],
+        v3: &[f32; 16]
+    ) -> (f32, f32, f32, f32) {
+        // Interleaved loads
+        let b0_low = _mm256_loadu_ps(v0.as_ptr());
+        let b1_low = _mm256_loadu_ps(v1.as_ptr());
+        let b2_low = _mm256_loadu_ps(v2.as_ptr());
+        let b3_low = _mm256_loadu_ps(v3.as_ptr());
+
+        let b0_high = _mm256_loadu_ps(v0.as_ptr().add(8));
+        let b1_high = _mm256_loadu_ps(v1.as_ptr().add(8));
+        let b2_high = _mm256_loadu_ps(v2.as_ptr().add(8));
+        let b3_high = _mm256_loadu_ps(v3.as_ptr().add(8));
+
+        // Interleaved subtractions and abs
+        let abs0_low = _mm256_and_ps(_mm256_sub_ps(q_low, b0_low), abs_mask);
+        let abs1_low = _mm256_and_ps(_mm256_sub_ps(q_low, b1_low), abs_mask);
+        let abs2_low = _mm256_and_ps(_mm256_sub_ps(q_low, b2_low), abs_mask);
+        let abs3_low = _mm256_and_ps(_mm256_sub_ps(q_low, b3_low), abs_mask);
+
+        let abs0_high = _mm256_and_ps(_mm256_sub_ps(q_high, b0_high), abs_mask);
+        let abs1_high = _mm256_and_ps(_mm256_sub_ps(q_high, b1_high), abs_mask);
+        let abs2_high = _mm256_and_ps(_mm256_sub_ps(q_high, b2_high), abs_mask);
+        let abs3_high = _mm256_and_ps(_mm256_sub_ps(q_high, b3_high), abs_mask);
+
+        // Masking and adding
+        let s0 = _mm256_add_ps(abs0_low, _mm256_and_ps(abs0_high, mask_high));
+        let s1 = _mm256_add_ps(abs1_low, _mm256_and_ps(abs1_high, mask_high));
+        let s2 = _mm256_add_ps(abs2_low, _mm256_and_ps(abs2_high, mask_high));
+        let s3 = _mm256_add_ps(abs3_low, _mm256_and_ps(abs3_high, mask_high));
+
+        (
+            self.hsum_avx2(s0),
+            self.hsum_avx2(s1),
+            self.hsum_avx2(s2),
+            self.hsum_avx2(s3)
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn hsum_avx2(&self, sum_vec: __m256) -> f32 {
         let x128_low = _mm256_castps256_ps128(sum_vec);
         let x128_high = _mm256_extractf128_ps(sum_vec, 1);
         let x_sum = _mm_add_ps(x128_low, x128_high);

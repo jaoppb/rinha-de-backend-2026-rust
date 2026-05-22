@@ -12,6 +12,10 @@ The system uses a highly specialized architecture to minimize overhead:
 - **Custom Parsers:** To eliminate generic library overhead, the project uses hand-rolled HTTP (`api/src/http_parser.rs`) and JSON (`api/src/json_parser.rs`) parsers.
 - **Search Optimization:** KNN search for fraud detection is implemented using an Inverted File (IVF) index with Manhattan distance, optimized for cache efficiency (`api/src/knn.rs`).
 
+## Performance Targets
+- **Average Latency:** < 2.0 ms
+- **Success Rate:** 100% (0% failures)
+
 ## Performance Baselines
 
 ### 2026-05-22 Benchmark (Optimized)
