@@ -12,9 +12,10 @@ export LOG_TRANSPORT="${LOG_TRANSPORT:-json}"
 echo "🚀 Iniciando stack..."
 docker compose up -d
 
-echo "⏳ Aguardando serviços ficarem prontos..."
-while ! docker compose logs api1 | grep -q "Successfully loaded all datasets." || ! docker compose logs api2 | grep -q "Successfully loaded all datasets."; do
-	sleep 1
+echo "⏳ Aguardando serviços ficarem prontos (smoke test)..."
+until make smoke > /dev/null 2>&1; do
+	echo "   ...aguardando backend responder corretamente..."
+	sleep 2
 done
 echo "✅ Serviços prontos!"
 
