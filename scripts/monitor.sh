@@ -12,6 +12,12 @@ export LOG_TRANSPORT="${LOG_TRANSPORT:-json}"
 echo "🚀 Iniciando stack..."
 docker compose up -d
 
+echo "⏳ Aguardando serviços ficarem prontos..."
+while ! docker compose logs api1 | grep -q "Successfully loaded all datasets." || ! docker compose logs api2 | grep -q "Successfully loaded all datasets."; do
+	sleep 1
+done
+echo "✅ Serviços prontos!"
+
 echo "📊 Monitoramento iniciado em $(date)"
 : >"$LOG_FILE"
 
