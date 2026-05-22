@@ -2,7 +2,7 @@ use crate::mmap::{IvfData, Record};
 
 const K: usize = 7;
 const N_CENTROIDS: usize = 256;
-const N_PROBE: usize = 10; // Number of clusters to search
+const N_PROBE: usize = 8; // Number of clusters to search
 const SCORE_EPS: f32 = 1e-6;
 const APPROVAL_THRESHOLD: f32 = 0.44;
 
@@ -15,17 +15,16 @@ impl IvfIndex {
         Self { data }
     }
 
-    pub fn search(&self, query: &[f32; 14], records: &[Record]) -> (bool, f32) {
+    pub fn search(&self, query: &[f32; 16], records: &[Record]) -> (bool, f32) {
         let centroids = self.data.centroids;
         let indices = self.data.indices;
         let offsets = self.data.offsets;
 
-        // 1. Find nearest clusters - Optimization: use select_nth_unstable instead of full sort
+        // 1. Find nearest clusters
         let mut cluster_dists = [(0usize, 0.0f32); N_CENTROIDS];
         for (i, centroid) in centroids.iter().enumerate() {
             cluster_dists[i] = (i, manhattan_distance(query, centroid, f32::MAX));
         }
-        // We only need the top N_PROBE, so select_nth_unstable is O(N) instead of O(N log N)
         let (probes, _, _) = cluster_dists.select_nth_unstable_by(N_PROBE, |a, b| a.1.partial_cmp(&b.1).unwrap());
         probes.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
@@ -38,14 +37,24 @@ impl IvfIndex {
             let start = offsets[c_idx] as usize;
             let end = offsets[c_idx + 1] as usize;
 
-            for &idx in &indices[start..end] {
+            let cluster_indices = &indices[start..end];
+            for k in 0..cluster_indices.len() {
+                let idx = cluster_indices[k];
+                
+                // Prefetch next record's vector (Record is 128 bytes, vector is the first 64 bytes)
+                #[cfg(target_arch = "x86_64")]
+                if k + 1 < cluster_indices.len() {
+                    let next_idx = cluster_indices[k + 1] as usize;
+                    unsafe {
+                        use std::arch::x86_64::_mm_prefetch;
+                        _mm_prefetch(records[next_idx].vector.as_ptr() as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    }
+                }
+
                 let record = &records[idx as usize];
-                // Optimization: Early exit if partial distance exceeds max_dist
                 let dist = manhattan_distance(query, &record.vector, max_dist);
 
                 if dist < max_dist {
-                    // Update top K manually instead of full sort every time
-                    // Since K is very small (7), a simple insertion is faster than sorting or a full heap
                     let mut pos = K - 1;
                     while pos > 0 && dist < top_k[pos - 1].0 {
                         top_k[pos] = top_k[pos - 1];
@@ -78,7 +87,7 @@ impl IvfIndex {
 }
 
 #[inline(always)]
-fn manhattan_distance(v1: &[f32; 14], v2: &[f32; 14], limit: f32) -> f32 {
+fn manhattan_distance(v1: &[f32; 16], v2: &[f32; 16], limit: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -91,45 +100,41 @@ fn manhattan_distance(v1: &[f32; 14], v2: &[f32; 14], limit: f32) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn manhattan_distance_avx2(v1: &[f32; 14], v2: &[f32; 14], limit: f32) -> f32 {
+unsafe fn manhattan_distance_avx2(v1: &[f32; 16], v2: &[f32; 16], _limit: f32) -> f32 {
     use std::arch::x86_64::*;
 
-    // Load first 8 floats
-    let a8 = _mm256_loadu_ps(v1.as_ptr());
-    let b8 = _mm256_loadu_ps(v2.as_ptr());
+    // Load all 16 floats (Record vector is now 64-byte aligned and 64 bytes total)
+    let a_low = _mm256_loadu_ps(v1.as_ptr());
+    let a_high = _mm256_loadu_ps(v1.as_ptr().add(8));
+    let b_low = _mm256_loadu_ps(v2.as_ptr());
+    let b_high = _mm256_loadu_ps(v2.as_ptr().add(8));
     
     // abs(a - b)
-    let diff8 = _mm256_sub_ps(a8, b8);
-    // Use bitwise AND with 0x7FFFFFFF to get absolute value
     let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
-    let abs8 = _mm256_and_ps(diff8, abs_mask);
+    let abs_low = _mm256_and_ps(_mm256_sub_ps(a_low, b_low), abs_mask);
+    let abs_high = _mm256_and_ps(_mm256_sub_ps(a_high, b_high), abs_mask);
     
-    // Horizontal sum of the 8 floats
-    // This is slightly faster than extracting individually
-    let mut sum8_buf = [0.0f32; 8];
-    _mm256_storeu_ps(sum8_buf.as_mut_ptr(), abs8);
-    let mut sum = sum8_buf[0] + sum8_buf[1] + sum8_buf[2] + sum8_buf[3] +
-                  sum8_buf[4] + sum8_buf[5] + sum8_buf[6] + sum8_buf[7];
-
-    if sum >= limit {
-        return sum;
-    }
-
-    // Remaining 6 floats (14 - 8 = 6)
-    for i in 8..14 {
-        sum += (v1[i] - v2[i]).abs();
-        if sum >= limit {
-            return sum;
-        }
-    }
-
-    sum
+    // Combine
+    let sum_vec = _mm256_add_ps(abs_low, abs_high);
+    
+    // Fast horizontal sum of 8 floats
+    let x128_low = _mm256_castps256_ps128(sum_vec);
+    let x128_high = _mm256_extractf128_ps(sum_vec, 1);
+    let x_sum = _mm_add_ps(x128_low, x128_high);
+    
+    // Horizontal sum of 4 floats in x_sum
+    let x_shuf = _mm_movehdup_ps(x_sum);
+    let x_sum2 = _mm_add_ps(x_sum, x_shuf);
+    let x_shuf2 = _mm_movehl_ps(x_sum2, x_sum2);
+    let x_final = _mm_add_ss(x_sum2, x_shuf2);
+    
+    _mm_cvtss_f32(x_final)
 }
 
 #[inline(always)]
-fn manhattan_distance_scalar(v1: &[f32; 14], v2: &[f32; 14], limit: f32) -> f32 {
+fn manhattan_distance_scalar(v1: &[f32; 16], v2: &[f32; 16], limit: f32) -> f32 {
     let mut sum = 0.0;
-    for i in 0..14 {
+    for i in 0..16 {
         sum += (v1[i] - v2[i]).abs();
         if sum >= limit {
             return sum;

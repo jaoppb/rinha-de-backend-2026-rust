@@ -4,9 +4,9 @@ use std::fs::File;
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct Record {
-    pub vector: [f32; 14], // 56 bytes
-    pub label: u8,         // 1 byte
-    pub _padding: [u8; 7], // 7 bytes
+    pub vector: [f32; 16],  // 64 bytes
+    pub label: u8,          // 1 byte
+    pub _padding: [u8; 63], // 63 bytes -> Total 128 bytes (aligned 64)
 }
 
 #[repr(C)]
@@ -33,7 +33,7 @@ pub struct IvfData {
     _centroids_mmap: Mmap,
     _indices_mmap: Mmap,
     _offsets_mmap: Mmap,
-    pub centroids: &'static [[f32; 14]],
+    pub centroids: &'static [[f32; 16]],
     pub indices: &'static [u32],
     pub offsets: &'static [u32],
 }
@@ -70,8 +70,8 @@ pub fn load_ivf_data() -> std::io::Result<IvfData> {
 
     let centroids = unsafe {
         std::slice::from_raw_parts(
-            centroids_mmap.as_ptr() as *const [f32; 14],
-            centroids_mmap.len() / std::mem::size_of::<[f32; 14]>(),
+            centroids_mmap.as_ptr() as *const [f32; 16],
+            centroids_mmap.len() / std::mem::size_of::<[f32; 16]>(),
         )
     };
 

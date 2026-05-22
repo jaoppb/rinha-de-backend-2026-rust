@@ -13,9 +13,9 @@ struct JsonRecord {
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct Record {
-    pub vector: [f32; 14], // 56 bytes
-    pub label: u8,         // 1 byte
-    pub _padding: [u8; 7], // 7 bytes
+    pub vector: [f32; 16],  // 64 bytes
+    pub label: u8,          // 1 byte
+    pub _padding: [u8; 63], // 63 bytes -> Total 128 bytes (aligned 64)
 }
 
 const N_CENTROIDS: usize = 256;
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Build IVF Index
-    let mut centroids = [[0.0f32; 14]; N_CENTROIDS];
+    let mut centroids = [[0.0f32; 16]; N_CENTROIDS];
     let stride = (records.len() / N_CENTROIDS).max(1);
     for i in 0..N_CENTROIDS {
         let idx = (i * stride).min(records.len() - 1);
@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut assignments = vec![0u16; records.len()];
     for _ in 0..N_ITERATIONS {
         let mut counts = [0u32; N_CENTROIDS];
-        let mut sums = [[0.0f32; 14]; N_CENTROIDS];
+        let mut sums = [[0.0f32; 16]; N_CENTROIDS];
 
         for (i, record) in records.iter().enumerate() {
             let mut min_dist = f32::MAX;
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             assignments[i] = best_c as u16;
             counts[best_c] += 1;
-            for d in 0..14 {
+            for d in 0..16 {
                 sums[best_c][d] += record.vector[d];
             }
         }
@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..N_CENTROIDS {
             if counts[i] > 0 {
                 let inv = 1.0 / counts[i] as f32;
-                for d in 0..14 {
+                for d in 0..16 {
                     centroids[i][d] = sums[i][d] * inv;
                 }
             } else {
@@ -147,16 +147,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn convert_record(jr: JsonRecord) -> Record {
+    let mut v = [0.0f32; 16];
+    v[..14].copy_from_slice(&jr.vector);
     Record {
-        vector: jr.vector,
+        vector: v,
         label: if jr.label == "fraud" { 1 } else { 0 },
-        _padding: [0; 7],
+        _padding: [0; 63],
     }
 }
 
-fn manhattan_distance(v1: &[f32; 14], v2: &[f32; 14]) -> f32 {
+fn manhattan_distance(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
     let mut sum = 0.0;
-    for i in 0..14 {
+    for i in 0..16 {
         sum += (v1[i] - v2[i]).abs();
     }
     sum

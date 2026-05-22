@@ -12,8 +12,8 @@ fn clamp(val: f32) -> f32 {
     }
 }
 
-pub fn vectorize(tx: &ParsedTransaction, lookups: &LookupData) -> Option<[f32; 14]> {
-    let mut vec = [0.0f32; 14];
+pub fn vectorize(tx: &ParsedTransaction, lookups: &LookupData) -> Option<[f32; 16]> {
+    let mut vec = [0.0f32; 16];
     let norm = &lookups.normalization;
 
     // 0. amount
