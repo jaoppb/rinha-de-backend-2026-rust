@@ -170,17 +170,31 @@ fn main() -> std::io::Result<()> {
                         let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
                         libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
 
-                        poll.registry().register(
-                            &mut SourceFd(&client_fd),
-                            Token(client_fd as usize),
-                            Interest::READABLE,
-                        ).ok();
+                        let mut buf = free_bufs.pop().unwrap_or_else(|| Box::new([0u8; BUF_SIZE]));
+                        let mut pos = 0;
+                        let started_at = crate::logging::timer_start();
 
-                        conns[client_fd as usize] = ConnState::Reading {
-                            buf: free_bufs.pop().unwrap_or_else(|| Box::new([0u8; BUF_SIZE])),
-                            pos: 0,
-                            started_at: crate::logging::timer_start(),
-                        };
+                        // Greedy Read
+                        let read_res = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut libc::c_void, BUF_SIZE) };
+                        if read_res > 0 {
+                            pos = read_res as usize;
+                            if let Some(final_state) = process_request(client_fd, &mut buf, pos, started_at, &app_state, &mut poll, &mut free_bufs) {
+                                conns[client_fd as usize] = handle_greedy_write(client_fd, final_state, &mut poll, &mut free_bufs).unwrap_or(ConnState::Idle);
+                            }
+                        } else {
+                            // WouldBlock or error, register for READABLE
+                            poll.registry().register(
+                                &mut SourceFd(&client_fd),
+                                Token(client_fd as usize),
+                                Interest::READABLE,
+                            ).ok();
+
+                            conns[client_fd as usize] = ConnState::Reading {
+                                buf,
+                                pos: 0,
+                                started_at,
+                            };
+                        }
                     } else {
                         libc::close(client_fd);
                     }
@@ -192,261 +206,271 @@ fn main() -> std::io::Result<()> {
             let token = event.token();
 
             if token == UDS_TOKEN {
-                // Handled above for priority
                 continue;
             } else {
                 let client_fd = token.0 as RawFd;
                 
                 if event.is_readable() {
-                    let mut should_close = false;
-                    if let ConnState::Reading { mut buf, mut pos, started_at } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
-                        loop {
-                            let res = unsafe {
-                                libc::read(client_fd, buf.as_mut_ptr().add(pos) as *mut libc::c_void, BUF_SIZE - pos)
-                            };
+                    if let ConnState::Reading { mut buf, pos, started_at } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
+                        let res = unsafe {
+                            libc::read(client_fd, buf.as_mut_ptr().add(pos) as *mut libc::c_void, BUF_SIZE - pos)
+                        };
 
-                            if res > 0 {
-                                pos += res as usize;
-                                let http_timer = crate::logging::timer_start();
-                                let (route, _) = parse_http_request(&buf[..pos]);
-                                crate::api_log_timing!(Level::Info, Category::Request, "http_parse", http_timer, "fd={}", client_fd);
-                                match route {
-                                    HttpRoute::Incomplete => {
-                                        if pos == BUF_SIZE {
-                                            should_close = true;
-                                            free_bufs.push(buf);
-                                            break;
-                                        }
-                                        conns[client_fd as usize] = ConnState::Reading { buf, pos, started_at };
-                                        break;
-                                    }
-                                    HttpRoute::Ready => {
-                                        let is_ready = app_state.is_some();
-                                        let resp: &[u8] = if is_ready {
-                                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-                                        } else {
-                                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
-                                        };
-                                        buf[..resp.len()].copy_from_slice(resp);
-                                        
-                                        poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
-                                        conns[client_fd as usize] = ConnState::Writing {
-                                            buf,
-                                            len: resp.len(),
-                                            written: 0,
-                                            started_at,
-                                            route: "ready",
-                                            status: if is_ready { 200 } else { 503 },
-                                        };
-                                        break;
-                                    }
-                                    HttpRoute::FraudScore(body_bytes) => {
-                                        if let Some(state) = &app_state {
-                                            let json_timer = crate::logging::timer_start();
-                                            let tx = if body_bytes.is_empty() { None } else { parse_json_payload(body_bytes) };
-                                            crate::api_log_timing!(Level::Info, Category::Request, "json_parse", json_timer, "fd={}", client_fd);
-
-                                            if let Some(tx) = tx {
-                                                let vec_timer = crate::logging::timer_start();
-                                                let vec_opt = vectorize(&tx, &state.lookups);
-                                                crate::api_log_timing!(Level::Info, Category::Request, "vectorize", vec_timer, "fd={}", client_fd);
-
-                                                if let Some(vec) = vec_opt {
-                                                    let knn_timer = crate::logging::timer_start();
-                                                    let (approved, score) = state.index.search(&vec, state.dataset.records);
-                                                    crate::api_log_timing!(Level::Info, Category::Request, "knn_search", knn_timer, "fd={}", client_fd);
-                                                    
-                                                    let mut pos = 0;
-                                                    
-                                                    // Construct JSON body manually to avoid format!
-                                                    let mut body_buf = [0u8; 64];
-                                                    let mut bp = 0;
-                                                    let body_start = b"{\"approved\":";
-                                                    body_buf[bp..bp+body_start.len()].copy_from_slice(body_start);
-                                                    bp += body_start.len();
-                                                    let app_str: &[u8] = if approved { b"true" } else { b"false" };
-                                                    body_buf[bp..bp+app_str.len()].copy_from_slice(app_str);
-                                                    bp += app_str.len();
-                                                    let score_mid = b",\"fraud_score\":";
-                                                    body_buf[bp..bp+score_mid.len()].copy_from_slice(score_mid);
-                                                    bp += score_mid.len();
-                                                    
-                                                    // Simple float to string (1 decimal place as required: 0.0)
-                                                    let s10 = (score * 10.0 + 0.5) as u32;
-                                                    let whole = s10 / 10;
-                                                    let frac = s10 % 10;
-                                                    
-                                                    if whole >= 10 {
-                                                        body_buf[bp] = b'0' + (whole / 10) as u8;
-                                                        bp += 1;
-                                                    }
-                                                    body_buf[bp] = b'0' + (whole % 10) as u8;
-                                                    bp += 1;
-                                                    body_buf[bp] = b'.';
-                                                    bp += 1;
-                                                    body_buf[bp] = b'0' + frac as u8;
-                                                    bp += 1;
-                                                    body_buf[bp] = b'}';
-                                                    bp += 1;
-                                                    
-                                                    let body = &body_buf[..bp];
-                                                    
-                                                    // Construct HTTP response
-                                                    let h1 = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
-                                                    buf[pos..pos+h1.len()].copy_from_slice(h1);
-                                                    pos += h1.len();
-                                                    
-                                                    let mut len_buf = [0u8; 8];
-                                                    let mut lp = 0;
-                                                    let mut n = bp;
-                                                    if n == 0 {
-                                                        len_buf[0] = b'0';
-                                                        lp = 1;
-                                                    } else {
-                                                        let mut temp = [0u8; 8];
-                                                        let mut tp = 0;
-                                                        while n > 0 {
-                                                            temp[tp] = b'0' + (n % 10) as u8;
-                                                            n /= 10;
-                                                            tp += 1;
-                                                        }
-                                                        while tp > 0 {
-                                                            tp -= 1;
-                                                            len_buf[lp] = temp[tp];
-                                                            lp += 1;
-                                                        }
-                                                    }
-                                                    buf[pos..pos+lp].copy_from_slice(&len_buf[..lp]);
-                                                    pos += lp;
-                                                    
-                                                    let h2 = b"\r\n\r\n";
-                                                    buf[pos..pos+h2.len()].copy_from_slice(h2);
-                                                    pos += h2.len();
-                                                    
-                                                    buf[pos..pos+body.len()].copy_from_slice(body);
-                                                    pos += body.len();
-
-                                                    poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
-                                                    conns[client_fd as usize] = ConnState::Writing {
-                                                        buf,
-                                                        len: pos,
-                                                        written: 0,
-                                                        started_at,
-                                                        route: "fraud-score",
-                                                        status: 200,
-                                                    };
-                                                } else {
-                                                    let resp = b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
-                                                    buf[..resp.len()].copy_from_slice(resp);
-                                                    poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
-                                                    conns[client_fd as usize] = ConnState::Writing {
-                                                        buf,
-                                                        len: resp.len(),
-                                                        written: 0,
-                                                        started_at,
-                                                        route: "fraud-score",
-                                                        status: 422,
-                                                    };
-                                                }
-                                            } else {
-                                                let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-                                                buf[..resp.len()].copy_from_slice(resp);
-                                                poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
-                                                conns[client_fd as usize] = ConnState::Writing {
-                                                    buf,
-                                                    len: resp.len(),
-                                                    written: 0,
-                                                    started_at,
-                                                    route: "fraud-score",
-                                                    status: 400,
-                                                };
-                                            }
-                                        } else {
-                                            let resp = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-                                            buf[..resp.len()].copy_from_slice(resp);
-                                            poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
-                                            conns[client_fd as usize] = ConnState::Writing {
-                                                buf,
-                                                len: resp.len(),
-                                                written: 0,
-                                                started_at,
-                                                route: "fraud-score",
-                                                status: 503,
-                                            };
-                                        };
-                                        break;
-                                    }
-
-                                    HttpRoute::NotFound => {
-                                        let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                                        buf[..resp.len()].copy_from_slice(resp);
-                                        poll.registry().reregister(&mut SourceFd(&client_fd), token, Interest::WRITABLE).ok();
-                                        conns[client_fd as usize] = ConnState::Writing {
-                                            buf,
-                                            len: resp.len(),
-                                            written: 0,
-                                            started_at,
-                                            route: "not-found",
-                                            status: 404,
-                                        };
-                                        break;
-                                    }
-                                }
-                            } else if res == 0 {
-                                should_close = true;
-                                free_bufs.push(buf);
-                                break;
+                        if res > 0 {
+                            let new_pos = pos + res as usize;
+                            if let Some(final_state) = process_request(client_fd, &mut buf, new_pos, started_at, &app_state, &mut poll, &mut free_bufs) {
+                                conns[client_fd as usize] = handle_greedy_write(client_fd, final_state, &mut poll, &mut free_bufs).unwrap_or(ConnState::Idle);
+                            }
+                        } else if res == 0 {
+                            unsafe { libc::close(client_fd); }
+                            free_bufs.push(buf);
+                        } else {
+                            let err = std::io::Error::last_os_error();
+                            if err.kind() == std::io::ErrorKind::WouldBlock {
+                                conns[client_fd as usize] = ConnState::Reading { buf, pos, started_at };
                             } else {
-                                let err = std::io::Error::last_os_error();
-                                if err.kind() == std::io::ErrorKind::WouldBlock {
-                                    conns[client_fd as usize] = ConnState::Reading { buf, pos, started_at };
-                                } else {
-                                    should_close = true;
-                                    free_bufs.push(buf);
-                                }
-                                break;
+                                unsafe { libc::close(client_fd); }
+                                free_bufs.push(buf);
                             }
                         }
-                    }
-                    if should_close {
-                        unsafe { libc::close(client_fd); }
-                        conns[client_fd as usize] = ConnState::Idle;
                     }
                 } else if event.is_writable() {
-                    let mut should_close = false;
-                    if let ConnState::Writing { buf, len, mut written, started_at, route, status } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
-                        loop {
-                            let res = unsafe {
-                                libc::write(client_fd, buf.as_ptr().add(written) as *const libc::c_void, len - written)
-                            };
-
-                            if res > 0 {
-                                written += res as usize;
-                                if written == len {
-                                    crate::api_log_timing!(Level::Info, Category::Request, "request_lifecycle", started_at, "fd={} route={} status={}", client_fd, route, status);
-                                    should_close = true;
-                                    free_bufs.push(buf);
-                                    break;
-                                }
-                                continue;
-                            } else {
-                                let err = std::io::Error::last_os_error();
-                                if err.kind() == std::io::ErrorKind::WouldBlock {
-                                    conns[client_fd as usize] = ConnState::Writing { buf, len, written, started_at, route, status };
-                                } else {
-                                    should_close = true;
-                                    free_bufs.push(buf);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if should_close {
-                        unsafe { libc::close(client_fd); }
-                        conns[client_fd as usize] = ConnState::Idle;
+                    if let ConnState::Writing { buf, len, written, started_at, route, status } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
+                        let final_state = ConnState::Writing { buf, len, written, started_at, route, status };
+                        conns[client_fd as usize] = handle_greedy_write(client_fd, final_state, &mut poll, &mut free_bufs).unwrap_or(ConnState::Idle);
                     }
                 }
             }
         }
     }
+}
+
+fn process_request(
+    client_fd: RawFd,
+    buf: &mut Box<[u8; BUF_SIZE]>,
+    pos: usize,
+    started_at: Timer,
+    app_state: &Option<AppState>,
+    poll: &mut Poll,
+    free_bufs: &mut Vec<Box<[u8; BUF_SIZE]>>
+) -> Option<ConnState> {
+    let http_timer = crate::logging::timer_start();
+    let (route, _) = parse_http_request(&buf[..pos]);
+    crate::api_log_timing!(Level::Info, Category::Request, "http_parse", http_timer, "fd={}", client_fd);
+
+    match route {
+        HttpRoute::Incomplete => {
+            if pos == BUF_SIZE {
+                unsafe { libc::close(client_fd); }
+                return None;
+            }
+            // Register if not already registered (token is client_fd)
+            poll.registry().register(
+                &mut SourceFd(&client_fd),
+                Token(client_fd as usize),
+                Interest::READABLE,
+            ).ok();
+            // Caller will store the Reading state
+            return None; 
+        }
+        HttpRoute::Ready => {
+            let is_ready = app_state.is_some();
+            let resp: &[u8] = if is_ready {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+            } else {
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+            };
+            buf[..resp.len()].copy_from_slice(resp);
+            
+            Some(ConnState::Writing {
+                buf: mem::replace(buf, Box::new([0u8; BUF_SIZE])), // Temporary swap, will be handled by greedy write
+                len: resp.len(),
+                written: 0,
+                started_at,
+                route: "ready",
+                status: if is_ready { 200 } else { 503 },
+            })
+        }
+        HttpRoute::FraudScore(body_bytes) => {
+            if let Some(state) = app_state {
+                let json_timer = crate::logging::timer_start();
+                let tx = if body_bytes.is_empty() { None } else { parse_json_payload(body_bytes) };
+                crate::api_log_timing!(Level::Info, Category::Request, "json_parse", json_timer, "fd={}", client_fd);
+
+                if let Some(tx) = tx {
+                    let vec_timer = crate::logging::timer_start();
+                    let vec_opt = vectorize(&tx, &state.lookups);
+                    crate::api_log_timing!(Level::Info, Category::Request, "vectorize", vec_timer, "fd={}", client_fd);
+
+                    if let Some(vec) = vec_opt {
+                        let knn_timer = crate::logging::timer_start();
+                        let (approved, score) = state.index.search(&vec, state.dataset.records);
+                        crate::api_log_timing!(Level::Info, Category::Request, "knn_search", knn_timer, "fd={}", client_fd);
+                        
+                        let mut out_pos = 0;
+                        
+                        let mut body_buf = [0u8; 64];
+                        let mut bp = 0;
+                        let body_start = b"{\"approved\":";
+                        body_buf[bp..bp+body_start.len()].copy_from_slice(body_start);
+                        bp += body_start.len();
+                        let app_str: &[u8] = if approved { b"true" } else { b"false" };
+                        body_buf[bp..bp+app_str.len()].copy_from_slice(app_str);
+                        bp += app_str.len();
+                        let score_mid = b",\"fraud_score\":";
+                        body_buf[bp..bp+score_mid.len()].copy_from_slice(score_mid);
+                        bp += score_mid.len();
+                        
+                        let s10 = (score * 10.0 + 0.5) as u32;
+                        let whole = s10 / 10;
+                        let frac = s10 % 10;
+                        
+                        if whole >= 10 {
+                            body_buf[bp] = b'0' + (whole / 10) as u8;
+                            bp += 1;
+                        }
+                        body_buf[bp] = b'0' + (whole % 10) as u8;
+                        bp += 1;
+                        body_buf[bp] = b'.';
+                        bp += 1;
+                        body_buf[bp] = b'0' + frac as u8;
+                        bp += 1;
+                        body_buf[bp] = b'}';
+                        bp += 1;
+                        
+                        let body = &body_buf[..bp];
+                        
+                        let h1 = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
+                        buf[out_pos..out_pos+h1.len()].copy_from_slice(h1);
+                        out_pos += h1.len();
+                        
+                        let mut len_buf = [0u8; 8];
+                        let mut lp = 0;
+                        let mut n = bp;
+                        if n == 0 {
+                            len_buf[0] = b'0';
+                            lp = 1;
+                        } else {
+                            let mut temp = [0u8; 8];
+                            let mut tp = 0;
+                            while n > 0 {
+                                temp[tp] = b'0' + (n % 10) as u8;
+                                n /= 10;
+                                tp += 1;
+                            }
+                            while tp > 0 {
+                                tp -= 1;
+                                len_buf[lp] = temp[tp];
+                                lp += 1;
+                            }
+                        }
+                        buf[out_pos..out_pos+lp].copy_from_slice(&len_buf[..lp]);
+                        out_pos += lp;
+                        
+                        let h2 = b"\r\n\r\n";
+                        buf[out_pos..out_pos+h2.len()].copy_from_slice(h2);
+                        out_pos += h2.len();
+                        
+                        buf[out_pos..out_pos+body.len()].copy_from_slice(body);
+                        out_pos += body.len();
+
+                        return Some(ConnState::Writing {
+                            buf: mem::replace(buf, Box::new([0u8; BUF_SIZE])),
+                            len: out_pos,
+                            written: 0,
+                            started_at,
+                            route: "fraud-score",
+                            status: 200,
+                        });
+                    } else {
+                        let resp = b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
+                        buf[..resp.len()].copy_from_slice(resp);
+                        return Some(ConnState::Writing {
+                            buf: mem::replace(buf, Box::new([0u8; BUF_SIZE])),
+                            len: resp.len(),
+                            written: 0,
+                            started_at,
+                            route: "fraud-score",
+                            status: 422,
+                        });
+                    }
+                } else {
+                    let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                    buf[..resp.len()].copy_from_slice(resp);
+                    return Some(ConnState::Writing {
+                        buf: mem::replace(buf, Box::new([0u8; BUF_SIZE])),
+                        len: resp.len(),
+                        written: 0,
+                        started_at,
+                        route: "fraud-score",
+                        status: 400,
+                    });
+                }
+            } else {
+                let resp = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                buf[..resp.len()].copy_from_slice(resp);
+                return Some(ConnState::Writing {
+                    buf: mem::replace(buf, Box::new([0u8; BUF_SIZE])),
+                    len: resp.len(),
+                    written: 0,
+                    started_at,
+                    route: "fraud-score",
+                    status: 503,
+                });
+            }
+        }
+        HttpRoute::NotFound => {
+            let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            buf[..resp.len()].copy_from_slice(resp);
+            Some(ConnState::Writing {
+                buf: mem::replace(buf, Box::new([0u8; BUF_SIZE])),
+                len: resp.len(),
+                written: 0,
+                started_at,
+                route: "not-found",
+                status: 404,
+            })
+        }
+    }
+}
+
+fn handle_greedy_write(
+    client_fd: RawFd,
+    state: ConnState,
+    poll: &mut Poll,
+    free_bufs: &mut Vec<Box<[u8; BUF_SIZE]>>
+) -> Option<ConnState> {
+    if let ConnState::Writing { buf, len, mut written, started_at, route, status } = state {
+        loop {
+            let res = unsafe {
+                libc::write(client_fd, buf.as_ptr().add(written) as *const libc::c_void, len - written)
+            };
+
+            if res > 0 {
+                written += res as usize;
+                if written == len {
+                    crate::api_log_timing!(Level::Info, Category::Request, "request_lifecycle", started_at, "fd={} route={} status={}", client_fd, route, status);
+                    unsafe { libc::close(client_fd); }
+                    free_bufs.push(buf);
+                    return None; // Fully written and closed
+                }
+                continue;
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    poll.registry().reregister(
+                        &mut SourceFd(&client_fd),
+                        Token(client_fd as usize),
+                        Interest::WRITABLE,
+                    ).ok();
+                    return Some(ConnState::Writing { buf, len, written, started_at, route, status });
+                } else {
+                    unsafe { libc::close(client_fd); }
+                    free_bufs.push(buf);
+                    return None;
+                }
+            }
+        }
+    }
+    None
 }
