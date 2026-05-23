@@ -32,6 +32,16 @@ The system uses a highly specialized architecture to minimize overhead:
 
 ## Performance Baselines
 
+### 2026-05-23 Benchmark (Optimized HIVF)
+
+- **Throughput:** 450.49 req/s
+- **p99 Latency:** 686.7 µs
+- **HTTP Success Rate:** 100% (0% failures)
+- **Classification Accuracy:** 98.94% (577 misclassifications)
+- **Status:** Hierarchical Inverted File (HIVF) implemented with K-Means++
+  initialization, Top-4 Soft Assignment, and Adaptive Probing (64-256 clusters).
+  Architected for 3,000,000 records.
+
 ### 2026-05-22 Benchmark (Optimized)
 
 - **Throughput:** 450.48 req/s
@@ -81,10 +91,11 @@ The system uses a highly specialized architecture to minimize overhead:
 
 The project is managed via a `Makefile` and `docker-compose.yml`.
 
-- **Build all:** `make build`
+- **Development Build:** `make build` (Uses `resources/example-references.json` - ~54k records).
+- **Release Build:** `make build-release` (Uses `resources/references.json.gz` - ~3M records).
 - **Run local stack:** `docker compose up`
-- **Prepare data:** The indexer must run before the API can start with fresh
-  data.
+- **Prepare data:** The indexer runs automatically during the Docker build phase
+  to convert JSON records into optimized binary artifacts.
 
 ### Testing
 
