@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use rand::prelude::*;
+use rayon::prelude::*;
 
 #[derive(Deserialize)]
 struct JsonRecord {
@@ -20,8 +21,11 @@ pub struct Record {
 const N_L1: usize = 256;
 const N_L2_PER_L1: usize = 256;
 const N_TOTAL_L2: usize = N_L1 * N_L2_PER_L1;
-const N_ITERATIONS: usize = 10;
-const SOFT_ASSIGNMENT_COUNT: usize = 4; // Map each record to its top 4 nearest L2 clusters
+const N_ITERATIONS: usize = 20;
+
+static FEATURE_WEIGHTS: [f32; 16] = [
+    1.2, 0.8, 1.0, 0.5, 0.5, 0.3, 0.3, 1.0, 1.2, 1.5, 0.7, 1.0, 1.0, 2.0, 0.0, 0.0,
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -58,9 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         json_records.into_iter().map(convert_record).collect()
     };
 
-    // Set original record index in padding for de-duplication
+    // Set original record index in padding for de-duplication (bit 0: label, bits 1-31: id)
     for (i, r) in records.iter_mut().enumerate() {
-        r.vector[14] = i as f32;
+        let label_bit = if r.vector[15] > 0.5 { 1u32 } else { 0u32 };
+        let id_bits = (i as u32) << 1;
+        let packed = id_bits | label_bit;
+        r.vector[15] = f32::from_bits(packed);
     }
 
     println!("Successfully loaded {} records", records.len());
@@ -73,76 +80,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut l1_assignments = vec![0usize; records.len()];
     train_k_means(&records, &mut l1_centroids, &mut l1_assignments, N_ITERATIONS);
 
-    // 2. L2 Clustering
+    // Group records by L1 for parallel L2 processing
+    let mut l1_groups: Vec<Vec<(usize, Record)>> = vec![Vec::new(); N_L1];
+    for (i, &l1_idx) in l1_assignments.iter().enumerate() {
+        l1_groups[l1_idx].push((i, records[i]));
+    }
+
+    // 2. L2 Clustering (Parallel)
     println!("Clustering L2 ({} sub-centroids per L1, total {})...", N_L2_PER_L1, N_TOTAL_L2);
-    let mut all_l2_centroids = vec![[0.0f32; 16]; N_TOTAL_L2];
-    let mut record_l2_multi_assignments = vec![Vec::with_capacity(2); records.len()];
-
-    for l1_idx in 0..N_L1 {
-        let l1_record_indices: Vec<usize> = l1_assignments.iter()
-            .enumerate()
-            .filter(|&(_, &idx)| idx == l1_idx)
-            .map(|(i, _)| i)
-            .collect();
-
-        if l1_record_indices.is_empty() {
-            continue;
+    
+    let l2_results: Vec<_> = l1_groups.into_par_iter().enumerate().map(|(l1_idx, group)| {
+        if group.is_empty() {
+            return (l1_idx, vec![[0.0f32; 16]; N_L2_PER_L1], vec![]);
         }
 
-        let l1_records: Vec<Record> = l1_record_indices.iter()
-            .map(|&i| records[i])
-            .collect();
-
+        let l1_records: Vec<Record> = group.iter().map(|&(_, r)| r).collect();
         let mut l2_centroids = init_kmeans_plus_plus(&l1_records, N_L2_PER_L1);
         let mut l2_assignments = vec![0usize; l1_records.len()];
         train_k_means(&l1_records, &mut l2_centroids, &mut l2_assignments, N_ITERATIONS);
 
-        // Copy back to global L2 centroids
+        // Map back to absolute indices and cluster IDs
+        let global_assignments: Vec<(usize, usize)> = l2_assignments.into_iter().enumerate().map(|(local_idx, best_l2)| {
+            let global_record_idx = group[local_idx].0;
+            let absolute_l2_idx = l1_idx * N_L2_PER_L1 + best_l2;
+            (global_record_idx, absolute_l2_idx)
+        }).collect();
+
+        (l1_idx, l2_centroids, global_assignments)
+    }).collect();
+
+    // Reconstruct global L2 state
+    let mut all_l2_centroids = vec![[0.0f32; 16]; N_TOTAL_L2];
+    let mut record_l2_assignments = vec![0usize; records.len()];
+    for (l1_idx, l2_centroids, assignments) in l2_results {
         for i in 0..N_L2_PER_L1 {
             all_l2_centroids[l1_idx * N_L2_PER_L1 + i] = l2_centroids[i];
         }
-
-        // Soft Assignment: Map each record in this L1 to top clusters
-        for (local_idx, record) in l1_records.iter().enumerate() {
-            let mut dists: Vec<(f32, usize)> = l2_centroids.iter()
-                .enumerate()
-                .map(|(c_idx, c)| (manhattan_distance(&record.vector, c), c_idx))
-                .collect();
-            
-            dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-            let global_record_idx = l1_record_indices[local_idx];
-            for i in 0..SOFT_ASSIGNMENT_COUNT.min(dists.len()) {
-                record_l2_multi_assignments[global_record_idx].push(l1_idx * N_L2_PER_L1 + dists[i].1);
-            }
-        }
-
-        if l1_idx % 32 == 0 {
-            println!("Processed L1 cluster {}/{}", l1_idx, N_L1);
+        for (global_idx, l2_idx) in assignments {
+            record_l2_assignments[global_idx] = l2_idx;
         }
     }
 
     // 3. Write artifacts
     println!("Writing artifacts...");
     
-    // Flatten record multi-assignments into (cluster_idx, record_idx) pairs
-    let mut flat_assignments = Vec::with_capacity(records.len() * 2);
-    for (r_idx, clusters) in record_l2_multi_assignments.iter().enumerate() {
-        for &c_idx in clusters {
-            flat_assignments.push((c_idx, r_idx));
-        }
-    }
+    // Sort by cluster index for contiguous disk access
+    let mut assignment_pairs: Vec<(usize, usize)> = record_l2_assignments.iter()
+        .enumerate()
+        .map(|(r_idx, &c_idx)| (c_idx, r_idx))
+        .collect();
     
-    // Sort by cluster index for contiguous disk access in API
-    flat_assignments.sort_by_key(|&(c, _)| c);
+    assignment_pairs.sort_by_key(|&(c, _)| c);
     
     let mut offsets = vec![0u32; N_TOTAL_L2 + 1];
     let mut current_offset = 0;
-    let mut final_records = Vec::with_capacity(flat_assignments.len());
+    let mut final_records = Vec::with_capacity(records.len());
     
     let mut current_c = 0;
     offsets[0] = 0;
-    for (c, i) in flat_assignments {
+    for (c, i) in assignment_pairs {
         while current_c < c {
             current_c += 1;
             offsets[current_c] = current_offset;
@@ -182,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         f.write_all(&o.to_ne_bytes())?;
     }
 
-    println!("All artifacts created in {}. Final dataset size: {} records (Soft Assignment)", 
+    println!("All artifacts created in {}. Final dataset size: {} records", 
         output_dir, final_records.len());
     Ok(())
 }
@@ -200,16 +196,16 @@ fn init_kmeans_plus_plus(records: &[Record], n_clusters: usize) -> Vec<[f32; 16]
     let mut min_dists = vec![f32::MAX; records.len()];
     for _ in 1..n_clusters {
         let last_centroid = centroids.last().unwrap();
-        let mut total_dist = 0.0;
         
-        for (i, record) in records.iter().enumerate() {
-            let d = manhattan_distance(&record.vector, last_centroid);
-            if d < min_dists[i] {
-                min_dists[i] = d;
+        min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
+            let record = &records[i];
+            let dist = manhattan_distance_weighted(&record.vector, last_centroid);
+            if dist < *d {
+                *d = dist;
             }
-            total_dist += min_dists[i] * min_dists[i]; // Probability proportional to distance squared
-        }
+        });
 
+        let total_dist: f32 = min_dists.iter().map(|d| d * d).sum();
         let mut threshold = rng.r#gen::<f32>() * total_dist;
         let mut chosen_idx = records.len() - 1;
         for (i, &d) in min_dists.iter().enumerate() {
@@ -229,18 +225,19 @@ fn train_k_means(records: &[Record], centroids: &mut [[f32; 16]], assignments: &
     let n_centroids = centroids.len();
     
     for _iter in 0..iterations {
-        for (i, record) in records.iter().enumerate() {
+        assignments.par_iter_mut().enumerate().for_each(|(i, best_c)| {
+            let record = &records[i];
             let mut min_dist = f32::MAX;
-            let mut best_c = 0;
+            let mut best = 0;
             for (c_idx, centroid) in centroids.iter().enumerate() {
-                let dist = manhattan_distance(&record.vector, centroid);
+                let dist = manhattan_distance_weighted(&record.vector, centroid);
                 if dist < min_dist {
                     min_dist = dist;
-                    best_c = c_idx;
+                    best = c_idx;
                 }
             }
-            assignments[i] = best_c;
-        }
+            *best_c = best;
+        });
 
         let mut new_centroids = vec![[0.0f32; 16]; n_centroids];
         let mut counts = vec![0usize; n_centroids];
@@ -263,14 +260,67 @@ fn train_k_means(records: &[Record], centroids: &mut [[f32; 16]], assignments: &
 
 fn convert_record(jr: JsonRecord) -> Record {
     let mut v = [0.0f32; 16];
-    for i in 0..14 { v[i] = jr.vector[i]; }
-    v[14] = 0.0; // Will be set to original index in main loop
+    let src = &jr.vector;
+
+    // 0. ln(1 + amount)
+    v[0] = (1.0 + src[0] * 10000.0).ln() / (1.0f32 + 10000.0f32).ln();
+    // 1. installments
+    v[1] = src[1];
+    // 2. amount_vs_avg_ratio
+    v[2] = src[2];
+    
+    // 3. hour_sin & 4. hour_cos
+    let hour = src[3] * 23.0;
+    let hour_rad = hour * 2.0 * std::f32::consts::PI / 24.0;
+    v[3] = hour_rad.sin();
+    v[4] = hour_rad.cos();
+    
+    // 5. day_sin & 6. day_cos
+    let dow = src[4] * 6.0;
+    let day_rad = dow * 2.0 * std::f32::consts::PI / 7.0;
+    v[5] = day_rad.sin();
+    v[6] = day_rad.cos();
+    
+    // 7. ln(1 + minutes_since_last_tx)
+    if src[5] >= 0.0 {
+        v[7] = (1.0 + src[5] * 1440.0).ln() / (1.0f32 + 1440.0f32).ln();
+    } else {
+        v[7] = -1.0;
+    }
+    
+    // 8. km_from_last_tx
+    v[8] = src[6];
+    // 9. km_from_home
+    v[9] = src[7];
+    // 10. tx_count_24h
+    v[10] = src[8];
+
+    // 11. Packed Binary (is_online:9, card_present:10, unknown_merchant:11)
+    let mut packed_binary = 0.0f32;
+    if src[9] > 0.5 { packed_binary += 1.0; }
+    if src[10] > 0.5 { packed_binary += 2.0; }
+    if src[11] > 0.5 { packed_binary += 4.0; }
+    v[11] = packed_binary / 7.0;
+
+    // 12. mcc_risk
+    v[12] = src[12];
+    
+    // 13. merchant_avg_amount
+    v[13] = src[13];
+
+    v[14] = 0.0; // Padding
+    
+    // 15. Packed ID (31 bits) & Label (1 bit)
+    // We'll set the ID in the main loop
     v[15] = if jr.label == "fraud" { 1.0 } else { 0.0 };
+    
     Record { vector: v }
 }
 
-fn manhattan_distance(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
+fn manhattan_distance_weighted(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
     let mut sum = 0.0;
-    for i in 0..14 { sum += (v1[i] - v2[i]).abs(); }
+    for i in 0..14 { 
+        sum += (v1[i] - v2[i]).abs() * FEATURE_WEIGHTS[i]; 
+    }
     sum
 }

@@ -20,8 +20,8 @@ The system uses a highly specialized architecture to minimize overhead:
 - **Custom Parsers:** To eliminate generic library overhead, the project uses
   hand-rolled HTTP (`api/src/http_parser.rs`) and JSON
   (`api/src/json_parser.rs`) parsers.
-- **Search Optimization:** KNN search for fraud detection is implemented using
-  a Hierarchical Inverted File (HIVF) index with Manhattan distance, optimized for
+- **Search Optimization:** KNN search for fraud detection is implemented using a
+  Hierarchical Inverted File (HIVF) index with Manhattan distance, optimized for
   extreme scale and cache efficiency (`api/src/knn.rs`).
 
 ## Performance Targets
@@ -48,8 +48,7 @@ The system uses a highly specialized architecture to minimize overhead:
 - **p99 Latency:** 2.68 ms
 - **Success Rate:** 100%
 - **KNN Tail Latency:** 4.97 ms (Reduced from 17.6ms)
-- **Status:** KNN loop unrolled (4x) and prefetched. Tail latency target (<5ms)
-  achieved.
+- **Status:** KNN loop unrolled (4x) and prefetched.
 
 ### 2026-05-22 Benchmark (Baseline)
 
@@ -91,8 +90,10 @@ The system uses a highly specialized architecture to minimize overhead:
 
 The project is managed via a `Makefile` and `docker-compose.yml`.
 
-- **Development Build:** `make build` (Uses `resources/example-references.json` - ~54k records).
-- **Release Build:** `make build-release` (Uses `resources/references.json.gz` - ~3M records).
+- **Development Build:** `make build` (Uses
+  `resources/example-references.json` - ~54k records).
+- **Release Build:** `make build-release` (Uses `resources/references.json.gz` -
+  ~3M records).
 - **Run local stack:** `docker compose up`
 - **Prepare data:** The indexer runs automatically during the Docker build phase
   to convert JSON records into optimized binary artifacts.
@@ -117,8 +118,8 @@ Testing is primarily done via `k6` scripts in the `test/` directory.
   routing algorithms.
 - **Target Hardware:** The competition/benchmark environment is a Mac mini
   (Late 2014) with a 2.6GHz dual-core Intel Core i5 processor (Haswell
-  microarchitecture) and 8GB RAM (<https://support.apple.com/en-us/111931>). This
-  means AVX2 is the maximum supported vector extension; AVX-512 is not
+  microarchitecture) and 8GB RAM (<https://support.apple.com/en-us/111931>).
+  This means AVX2 is the maximum supported vector extension; AVX-512 is not
   available.
 
 ## Documentation

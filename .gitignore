@@ -1,6 +1,11 @@
 target/
 test/results.json
 /*.log
+monitor_logs.log
+resource_usage.log
+test_stats.log
 benchmark_results/
 benchmark_logs.json
 .gemini/
+data/*.bin
+data/offsets.bin

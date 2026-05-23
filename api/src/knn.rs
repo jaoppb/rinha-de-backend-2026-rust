@@ -5,12 +5,32 @@ const K: usize = 7;
 const N_L1: usize = 256;
 const N_L2_PER_L1: usize = 256;
 const N_PROBE_L1: usize = 16;
-const N_PROBE_L2: usize = 64;
-const N_PROBE_L2_EXTENDED: usize = 256; // Extended probe for adaptive search
+const N_PROBE_L2: usize = 256;
+const N_PROBE_L2_EXTENDED: usize = 512;
 const SCORE_EPS: f32 = 1e-6;
 const APPROVAL_THRESHOLD: f32 = 0.44;
-const CONFIDENCE_THRESHOLD_LOW: f32 = 0.38; // Lower bound for "borderline" score
-const CONFIDENCE_THRESHOLD_HIGH: f32 = 0.50; // Upper bound for "borderline" score
+const CONFIDENCE_THRESHOLD_LOW: f32 = 0.38;
+const CONFIDENCE_THRESHOLD_HIGH: f32 = 0.50;
+
+// Feature weights for the 14 features (0-13). 14 and 15 are metadata.
+static FEATURE_WEIGHTS: [f32; 16] = [
+    1.2, // 0: ln(1 + amount)
+    0.8, // 1: installments
+    1.0, // 2: amount_vs_avg_ratio
+    0.5, // 3: hour_sin
+    0.5, // 4: hour_cos
+    0.3, // 5: day_sin
+    0.3, // 6: day_cos
+    1.0, // 7: ln(1 + minutes_since_last_tx)
+    1.2, // 8: km_from_last_tx
+    1.5, // 9: km_from_home
+    0.7, // 10: tx_count_24h
+    2.5, // 11: Packed Binary (is_online, card_present, unknown_merchant)
+    2.0, // 12: mcc_risk
+    1.0, // 13: merchant_avg_amount
+    0.0, // 14: Padding
+    0.0, // 15: Packed ID & Label
+];
 
 pub struct IvfIndex {
     data: IvfData,
@@ -41,15 +61,16 @@ impl IvfIndex {
 
         let q_low = _mm256_loadu_ps(query.as_ptr());
         let q_high = _mm256_loadu_ps(query.as_ptr().add(8));
+        let w_low = _mm256_loadu_ps(FEATURE_WEIGHTS.as_ptr());
+        let w_high = _mm256_loadu_ps(FEATURE_WEIGHTS.as_ptr().add(8));
         let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
-        let mask_high = _mm256_castsi256_ps(_mm256_set_epi32(0, 0, -1, -1, -1, -1, -1, -1));
 
         // 1. Scan L1 Root
         let mut best_l1 = [(f32::MAX, 0usize); N_PROBE_L1];
         let mut i = 0;
         while i + 3 < N_L1 {
-            let (d0, d1, d2, d3) = self.dist_avx2_preloaded_x4(
-                q_low, q_high, abs_mask, mask_high,
+            let (d0, d1, d2, d3) = self.dist_avx2_weighted_x4(
+                q_low, q_high, w_low, w_high, abs_mask,
                 &l1_centroids[i], &l1_centroids[i+1], &l1_centroids[i+2], &l1_centroids[i+3]
             );
             update_best_probes::<N_PROBE_L1>(&mut best_l1, d0, i);
@@ -66,16 +87,13 @@ impl IvfIndex {
             let l2_base = l1_idx * N_L2_PER_L1;
             let mut j = 0;
             while j + 7 < N_L2_PER_L1 {
-                // SIMD Horizontal Pruning (Block of 8)
-                // We calculate distances for 8 centroids and update best_l2.
-                // The dist_avx2_preloaded_x4 is already very fast.
-                let (d0, d1, d2, d3) = self.dist_avx2_preloaded_x4(
-                    q_low, q_high, abs_mask, mask_high,
+                let (d0, d1, d2, d3) = self.dist_avx2_weighted_x4(
+                    q_low, q_high, w_low, w_high, abs_mask,
                     &l2_centroids[l2_base + j], &l2_centroids[l2_base + j + 1], 
                     &l2_centroids[l2_base + j + 2], &l2_centroids[l2_base + j + 3]
                 );
-                let (d4, d5, d6, d7) = self.dist_avx2_preloaded_x4(
-                    q_low, q_high, abs_mask, mask_high,
+                let (d4, d5, d6, d7) = self.dist_avx2_weighted_x4(
+                    q_low, q_high, w_low, w_high, abs_mask,
                     &l2_centroids[l2_base + j + 4], &l2_centroids[l2_base + j + 5], 
                     &l2_centroids[l2_base + j + 6], &l2_centroids[l2_base + j + 7]
                 );
@@ -93,25 +111,25 @@ impl IvfIndex {
             }
         }
 
-        // 3. Scan Records in top 64 clusters (Initial Probe)
+        // 3. Scan Records in top 256 clusters
         let mut top_k = [(f32::MAX, 0u8, 0usize); K];
         let mut max_dist = f32::MAX;
 
         for probe_idx in 0..N_PROBE_L2 {
-            max_dist = self.scan_cluster_dedup(best_l2[probe_idx].1, records, offsets, q_low, q_high, abs_mask, mask_high, &mut top_k, max_dist);
+            max_dist = self.scan_cluster_weighted(best_l2[probe_idx].1, records, offsets, q_low, q_high, w_low, w_high, abs_mask, &mut top_k, max_dist);
         }
 
-        let (approved, score) = self.calculate_fraud_score_dedup(top_k);
+        let (approved, score) = self.calculate_fraud_score_weighted(top_k);
 
-        // 4. Adaptive Probing: If score is borderline, expand search
+        // 4. Adaptive Probing
         if (score > CONFIDENCE_THRESHOLD_LOW && score < CONFIDENCE_THRESHOLD_HIGH) || top_k[0].0 > 1.5 {
             let mut extended_top_k = top_k;
             let mut extended_max_dist = max_dist;
             for probe_idx in N_PROBE_L2..N_PROBE_L2_EXTENDED {
                 if best_l2[probe_idx].0 == f32::MAX { break; }
-                extended_max_dist = self.scan_cluster_dedup(best_l2[probe_idx].1, records, offsets, q_low, q_high, abs_mask, mask_high, &mut extended_top_k, extended_max_dist);
+                extended_max_dist = self.scan_cluster_weighted(best_l2[probe_idx].1, records, offsets, q_low, q_high, w_low, w_high, abs_mask, &mut extended_top_k, extended_max_dist);
             }
-            return self.calculate_fraud_score_dedup(extended_top_k);
+            return self.calculate_fraud_score_weighted(extended_top_k);
         }
 
         (approved, score)
@@ -119,15 +137,16 @@ impl IvfIndex {
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn scan_cluster_dedup(
+    unsafe fn scan_cluster_weighted(
         &self,
         l2_idx: usize,
         records: &[Record],
         offsets: &[u32],
         q_low: __m256,
         q_high: __m256,
+        w_low: __m256,
+        w_high: __m256,
         abs_mask: __m256,
-        mask_high: __m256,
         top_k: &mut [(f32, u8, usize); K],
         mut max_dist: f32
     ) -> f32 {
@@ -140,44 +159,59 @@ impl IvfIndex {
             if k + 12 < cluster_records.len() {
                 _mm_prefetch(cluster_records[k + 12].vector.as_ptr() as *const i8, _MM_HINT_T0);
             }
-            let (d0, d1, d2, d3) = self.dist_avx2_preloaded_x4(
-                q_low, q_high, abs_mask, mask_high,
+            let (d0, d1, d2, d3) = self.dist_avx2_weighted_x4(
+                q_low, q_high, w_low, w_high, abs_mask,
                 &cluster_records[k].vector, &cluster_records[k+1].vector, 
                 &cluster_records[k+2].vector, &cluster_records[k+3].vector
             );
 
-            // Record de-duplication using original index stored in padding vector[14]
-            if d0 < max_dist { max_dist = update_top_k_dedup(top_k, d0, cluster_records[k].vector[15] as u8, cluster_records[k].vector[14] as u32 as usize); }
-            if d1 < max_dist { max_dist = update_top_k_dedup(top_k, d1, cluster_records[k+1].vector[15] as u8, cluster_records[k+1].vector[14] as u32 as usize); }
-            if d2 < max_dist { max_dist = update_top_k_dedup(top_k, d2, cluster_records[k+2].vector[15] as u8, cluster_records[k+2].vector[14] as u32 as usize); }
-            if d3 < max_dist { max_dist = update_top_k_dedup(top_k, d3, cluster_records[k+3].vector[15] as u8, cluster_records[k+3].vector[14] as u32 as usize); }
+            if d0 < max_dist { max_dist = self.update_top_k_packed(top_k, d0, cluster_records[k].vector[15]); }
+            if d1 < max_dist { max_dist = self.update_top_k_packed(top_k, d1, cluster_records[k+1].vector[15]); }
+            if d2 < max_dist { max_dist = self.update_top_k_packed(top_k, d2, cluster_records[k+2].vector[15]); }
+            if d3 < max_dist { max_dist = self.update_top_k_packed(top_k, d3, cluster_records[k+3].vector[15]); }
             k += 4;
         }
         while k < cluster_records.len() {
-            let dist = self.dist_avx2_preloaded(q_low, q_high, abs_mask, mask_high, &cluster_records[k].vector);
+            let dist = self.dist_avx2_weighted(q_low, q_high, w_low, w_high, abs_mask, &cluster_records[k].vector);
             if dist < max_dist {
-                max_dist = update_top_k_dedup(top_k, dist, cluster_records[k].vector[15] as u8, cluster_records[k].vector[14] as u32 as usize);
+                max_dist = self.update_top_k_packed(top_k, dist, cluster_records[k].vector[15]);
             }
             k += 1;
         }
         max_dist
     }
 
+    #[inline(always)]
+    fn update_top_k_packed(&self, top_k: &mut [(f32, u8, usize); K], dist: f32, packed_f32: f32) -> f32 {
+        let packed = packed_f32.to_bits();
+        let label = (packed & 1) as u8;
+        let id = (packed >> 1) as usize;
+
+        if dist < top_k[K - 1].0 {
+            let mut pos = K - 1;
+            while pos > 0 && dist < top_k[pos - 1].0 {
+                top_k[pos] = top_k[pos - 1];
+                pos -= 1;
+            }
+            top_k[pos] = (dist, label, id);
+        }
+        top_k[K - 1].0
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn dist_avx2_preloaded(&self, q_low: __m256, q_high: __m256, abs_mask: __m256, mask_high: __m256, v2: &[f32; 16]) -> f32 {
+    unsafe fn dist_avx2_weighted(&self, q_low: __m256, q_high: __m256, w_low: __m256, w_high: __m256, abs_mask: __m256, v2: &[f32; 16]) -> f32 {
         let b_low = _mm256_loadu_ps(v2.as_ptr());
         let b_high = _mm256_loadu_ps(v2.as_ptr().add(8));
-        let abs_low = _mm256_and_ps(_mm256_sub_ps(q_low, b_low), abs_mask);
-        let abs_high = _mm256_and_ps(_mm256_sub_ps(q_high, b_high), abs_mask);
-        let masked_high = _mm256_and_ps(abs_high, mask_high);
-        let sum_vec = _mm256_add_ps(abs_low, masked_high);
+        let diff_low = _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b_low), abs_mask), w_low);
+        let diff_high = _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b_high), abs_mask), w_high);
+        let sum_vec = _mm256_add_ps(diff_low, diff_high);
         self.hsum_avx2(sum_vec)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn dist_avx2_preloaded_x4(&self, q_low: __m256, q_high: __m256, abs_mask: __m256, mask_high: __m256, v0: &[f32; 16], v1: &[f32; 16], v2: &[f32; 16], v3: &[f32; 16]) -> (f32, f32, f32, f32) {
+    unsafe fn dist_avx2_weighted_x4(&self, q_low: __m256, q_high: __m256, w_low: __m256, w_high: __m256, abs_mask: __m256, v0: &[f32; 16], v1: &[f32; 16], v2: &[f32; 16], v3: &[f32; 16]) -> (f32, f32, f32, f32) {
         let b0_low = _mm256_loadu_ps(v0.as_ptr());
         let b1_low = _mm256_loadu_ps(v1.as_ptr());
         let b2_low = _mm256_loadu_ps(v2.as_ptr());
@@ -186,10 +220,12 @@ impl IvfIndex {
         let b1_high = _mm256_loadu_ps(v1.as_ptr().add(8));
         let b2_high = _mm256_loadu_ps(v2.as_ptr().add(8));
         let b3_high = _mm256_loadu_ps(v3.as_ptr().add(8));
-        let s0 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b0_low), abs_mask), _mm256_and_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b0_high), abs_mask), mask_high));
-        let s1 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b1_low), abs_mask), _mm256_and_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b1_high), abs_mask), mask_high));
-        let s2 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b2_low), abs_mask), _mm256_and_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b2_high), abs_mask), mask_high));
-        let s3 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b3_low), abs_mask), _mm256_and_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b3_high), abs_mask), mask_high));
+        
+        let s0 = _mm256_add_ps(_mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b0_low), abs_mask), w_low), _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b0_high), abs_mask), w_high));
+        let s1 = _mm256_add_ps(_mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b1_low), abs_mask), w_low), _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b1_high), abs_mask), w_high));
+        let s2 = _mm256_add_ps(_mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b2_low), abs_mask), w_low), _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b2_high), abs_mask), w_high));
+        let s3 = _mm256_add_ps(_mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b3_low), abs_mask), w_low), _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b3_high), abs_mask), w_high));
+        
         (self.hsum_avx2(s0), self.hsum_avx2(s1), self.hsum_avx2(s2), self.hsum_avx2(s3))
     }
 
@@ -232,12 +268,12 @@ impl IvfIndex {
             for record in &records[start..end] {
                 let dist = manhattan_distance_scalar(query, &record.vector);
                 if dist < max_dist {
-                    max_dist = update_top_k_dedup(&mut top_k, dist, record.vector[15] as u8, record.vector[14] as u32 as usize);
+                    max_dist = self.update_top_k_packed_scalar(&mut top_k, dist, record.vector[15]);
                 }
             }
         }
         
-        let (_, score) = self.calculate_fraud_score_dedup(top_k);
+        let (_, score) = self.calculate_fraud_score_weighted(top_k);
         if (score > CONFIDENCE_THRESHOLD_LOW && score < CONFIDENCE_THRESHOLD_HIGH) || top_k[0].0 > 1.5 {
             for probe_idx in N_PROBE_L2..N_PROBE_L2_EXTENDED {
                 if best_l2[probe_idx].0 == f32::MAX { break; }
@@ -247,21 +283,39 @@ impl IvfIndex {
                 for record in &records[start..end] {
                     let dist = manhattan_distance_scalar(query, &record.vector);
                     if dist < max_dist {
-                        max_dist = update_top_k_dedup(&mut top_k, dist, record.vector[15] as u8, record.vector[14] as u32 as usize);
+                        max_dist = self.update_top_k_packed_scalar(&mut top_k, dist, record.vector[15]);
                     }
                 }
             }
         }
 
-        self.calculate_fraud_score_dedup(top_k)
+        self.calculate_fraud_score_weighted(top_k)
     }
 
-    fn calculate_fraud_score_dedup(&self, top_k: [(f32, u8, usize); K]) -> (bool, f32) {
+    #[inline(always)]
+    fn update_top_k_packed_scalar(&self, top_k: &mut [(f32, u8, usize); K], dist: f32, packed_f32: f32) -> f32 {
+        let packed = packed_f32.to_bits();
+        let label = (packed & 1) as u8;
+        let id = (packed >> 1) as usize;
+
+        if dist < top_k[K - 1].0 {
+            let mut pos = K - 1;
+            while pos > 0 && dist < top_k[pos - 1].0 {
+                top_k[pos] = top_k[pos - 1];
+                pos -= 1;
+            }
+            top_k[pos] = (dist, label, id);
+        }
+        top_k[K - 1].0
+    }
+
+    fn calculate_fraud_score_weighted(&self, top_k: [(f32, u8, usize); K]) -> (bool, f32) {
         let mut fraud_weight = 0.0f32;
         let mut total_weight = 0.0f32;
         for &(dist, label, _) in &top_k {
             if dist == f32::MAX { continue; }
-            let weight = 1.0 / (1.0 + dist + SCORE_EPS);
+            // Kernel: exp(-dist * 0.5)
+            let weight = (-dist * 0.5).exp();
             total_weight += weight;
             fraud_weight += weight * label as f32;
         }
@@ -283,35 +337,10 @@ fn update_best_probes<const N: usize>(best: &mut [(f32, usize); N], dist: f32, i
 }
 
 #[inline(always)]
-fn update_top_k_dedup(top_k: &mut [(f32, u8, usize); K], dist: f32, label: u8, id: usize) -> f32 {
-    for i in 0..K {
-        if top_k[i].2 == id && id != 0 {
-            if dist < top_k[i].0 {
-                top_k[i].0 = dist;
-                let mut j = i;
-                while j > 0 && top_k[j].0 < top_k[j-1].0 {
-                    top_k.swap(j, j-1);
-                    j -= 1;
-                }
-            }
-            return top_k[K-1].0;
-        }
-    }
-
-    if dist < top_k[K - 1].0 {
-        let mut pos = K - 1;
-        while pos > 0 && dist < top_k[pos - 1].0 {
-            top_k[pos] = top_k[pos - 1];
-            pos -= 1;
-        }
-        top_k[pos] = (dist, label, id);
-    }
-    top_k[K - 1].0
-}
-
-#[inline(always)]
 fn manhattan_distance_scalar(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
     let mut sum = 0.0;
-    for i in 0..14 { sum += (v1[i] - v2[i]).abs(); }
+    for i in 0..14 { 
+        sum += (v1[i] - v2[i]).abs() * FEATURE_WEIGHTS[i]; 
+    }
     sum
 }

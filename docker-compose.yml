@@ -14,7 +14,7 @@ services:
       resources:
         limits:
           cpus: '0.2'
-          memory: '30M'
+          memory: '20M'
 
   api1: &api
     image: jaoppb/rinha-2026-rust:latest
@@ -22,6 +22,7 @@ services:
     restart: always
     volumes:
       - shared-data:/data/shared
+      - ./data:/app/data
     environment:
       - SOCK=/data/shared/api1.sock
       - LOG_TRANSPORT=${LOG_TRANSPORT:-text}
@@ -29,7 +30,7 @@ services:
       resources:
         limits:
           cpus: '0.4'
-          memory: '160M'
+          memory: '260M'
 
   api2:
     <<: *api

@@ -5,6 +5,7 @@ K6_IMAGE = grafana/k6
 PWD = $(shell pwd)
 API_IMAGE = jaoppb/rinha-2026-rust:latest
 LB_IMAGE = jaoppb/rinha-2026-lb:latest
+INPUT_FILE ?= resources/example-references.json
 
 # Core build target
 build-images:
@@ -13,11 +14,11 @@ build-images:
 
 # Default dev build: example data
 build:
-	make build-images INPUT_FILE=resources/example-references.json
+	$(MAKE) build-images INPUT_FILE=resources/example-references.json
 
 # Release build: full data
 build-release:
-	make build-images INPUT_FILE=resources/references.json.gz
+	$(MAKE) build-images INPUT_FILE=resources/references.json.gz
 
 # Build images with verbose-logging feature enabled (tags with :verbose)
 build-verbose:
