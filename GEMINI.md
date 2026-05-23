@@ -26,8 +26,9 @@ The system uses a highly specialized architecture to minimize overhead:
 
 ## Performance Targets
 
-- **Average Latency:** < 1.0 ms
-- **Success Rate:** 100% (0% failures)
+- **p99 Latency:** < 0.5 ms
+- **HTTP Success Rate:** 100% (0% failures)
+- **Classification Accuracy:** 100% (0% misclassifications)
 
 ## Performance Baselines
 

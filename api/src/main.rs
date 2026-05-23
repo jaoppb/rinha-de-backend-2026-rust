@@ -110,7 +110,7 @@ fn main() -> std::io::Result<()> {
         
         // Warm up memory maps
         let mut sum = 0.0f32;
-        for r in d.records.iter().take(1000) { sum += r.vector[0]; }
+        for r in d.records.iter().take(1000) { sum += r.vector[0] as f32; }
         for c in i.centroids.iter() { sum += c[0]; }
         for o in i.offsets.iter() { sum += *o as f32; }
         println!("Warmup complete (dummy sum: {})", sum);
@@ -151,8 +151,10 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        // Prioritize UDS processing: drain it completely before processing other events
-        loop {
+        // Prioritize UDS processing: bound it to prevent starvation of existing requests
+        let mut uds_budget = 16;
+        while uds_budget > 0 {
+            uds_budget -= 1;
             unsafe {
                 msg.msg_controllen = cmsg_buf.len() as _;
                 let res = libc::recvmsg(uds_fd, &mut msg, 0);

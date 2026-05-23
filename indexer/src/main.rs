@@ -56,23 +56,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Successfully loaded {} records", records.len());
     std::fs::create_dir_all(output_dir)?;
 
-    // Build IVF Index
-    let mut centroids = [[0.0f32; 16]; N_CENTROIDS];
+    // 1. K-Means
+    println!("Clustering with K-Means ({} centroids, {} iterations)...", N_CENTROIDS, N_ITERATIONS);
+    let mut centroids = vec![[0.0f32; 16]; N_CENTROIDS];
     let stride = (records.len() / N_CENTROIDS).max(1);
     for i in 0..N_CENTROIDS {
         let idx = (i * stride).min(records.len() - 1);
         centroids[i] = records[idx].vector;
     }
 
-    let mut assignments = vec![0u16; records.len()];
+    let mut record_assignments = vec![0usize; records.len()];
     for iter in 0..N_ITERATIONS {
-        println!("K-Means iteration {}/{}...", iter + 1, N_ITERATIONS);
-        let mut counts = [0u32; N_CENTROIDS];
-        let mut sums = [[0.0f32; 16]; N_CENTROIDS];
-
+        println!("Iteration {}...", iter + 1);
         for (i, record) in records.iter().enumerate() {
             let mut min_dist = f32::MAX;
-            let mut best_c = 0usize;
+            let mut best_c = 0;
             for (c_idx, centroid) in centroids.iter().enumerate() {
                 let dist = manhattan_distance(&record.vector, centroid);
                 if dist < min_dist {
@@ -80,75 +78,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     best_c = c_idx;
                 }
             }
-            assignments[i] = best_c as u16;
-            counts[best_c] += 1;
-            for d in 0..14 { // Only sum feature dimensions
-                sums[best_c][d] += record.vector[d];
-            }
+            record_assignments[i] = best_c;
         }
 
+        let mut new_centroids = vec![[0.0f32; 16]; N_CENTROIDS];
+        let mut counts = vec![0usize; N_CENTROIDS];
+        for (i, &assignment) in record_assignments.iter().enumerate() {
+            for j in 0..14 {
+                new_centroids[assignment][j] += records[i].vector[j];
+            }
+            counts[assignment] += 1;
+        }
         for i in 0..N_CENTROIDS {
             if counts[i] > 0 {
-                let inv = 1.0 / counts[i] as f32;
-                for d in 0..14 {
-                    centroids[i][d] = sums[i][d] * inv;
+                for j in 0..14 {
+                    new_centroids[i][j] /= counts[i] as f32;
                 }
-                centroids[i][14] = 0.0;
-                centroids[i][15] = 0.0;
-            } else {
-                let idx = (iter * i + i) % records.len();
-                centroids[i] = records[idx].vector;
-                centroids[i][15] = 0.0; // Clear label from centroid
+                centroids[i] = new_centroids[i];
             }
         }
     }
 
-    let mut counts = [0u32; N_CENTROIDS];
-    for &c_idx in &assignments {
-        counts[c_idx as usize] += 1;
-    }
+    // 2. Write artifacts
+    println!("Writing artifacts...");
     
-    let max_count = counts.iter().max().unwrap();
-    let min_count = counts.iter().min().unwrap();
-    let avg_count = records.len() as f32 / N_CENTROIDS as f32;
-    println!("Cluster stats: min={}, max={}, avg={:.2}", min_count, max_count, avg_count);
-
-    let mut offsets = [0u32; N_CENTROIDS + 1];
-    for i in 0..N_CENTROIDS {
-        offsets[i + 1] = offsets[i] + counts[i];
+    // Sort records by cluster
+    let mut clustered_records = records.clone();
+    let mut indexed_assignments: Vec<(usize, usize)> = record_assignments.iter().cloned().enumerate().map(|(i, c)| (c, i)).collect();
+    indexed_assignments.sort_by_key(|&(_, i)| i); // Keep original order for stability? No, sort by cluster.
+    indexed_assignments.sort_by_key(|&(c, _)| c);
+    
+    let mut offsets = vec![0u32; N_CENTROIDS + 1];
+    let mut current_offset = 0;
+    let mut final_records = Vec::with_capacity(records.len());
+    
+    let mut current_c = 0;
+    offsets[0] = 0;
+    for (c, i) in indexed_assignments {
+        while current_c < c {
+            current_c += 1;
+            offsets[current_c] = current_offset;
+        }
+        final_records.push(records[i]);
+        current_offset += 1;
+    }
+    while current_c < N_CENTROIDS {
+        current_c += 1;
+        offsets[current_c] = current_offset;
     }
 
-    // Reorder records by cluster
-    println!("Reordering records for contiguous access...");
-    let mut reordered_records = vec![Record { vector: [0.0; 16] }; records.len()];
-    let mut current_pos = offsets;
-    for (i, &c_idx) in assignments.iter().enumerate() {
-        let pos = current_pos[c_idx as usize];
-        reordered_records[pos as usize] = records[i];
-        current_pos[c_idx as usize] += 1;
-    }
-
-    // 1. Write reordered dataset.bin
-    println!("Writing reordered dataset.bin...");
     let dataset_path = Path::new(output_dir).join("dataset.bin");
     let mut f = File::create(&dataset_path)?;
-    for record in &reordered_records {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (record as *const Record) as *const u8,
-                std::mem::size_of::<Record>(),
-            )
-        };
+    for record in &final_records {
+        let bytes = unsafe { std::slice::from_raw_parts((record as *const Record) as *const u8, 64) };
         f.write_all(bytes)?;
     }
 
-    // 2. Write Index Artifacts
-    println!("Writing index artifacts...");
-    File::create(Path::new(output_dir).join("centroids.bin"))?
-        .write_all(unsafe { std::slice::from_raw_parts(centroids.as_ptr() as *const u8, std::mem::size_of_val(&centroids)) })?;
+    let centroids_path = Path::new(output_dir).join("centroids.bin");
+    let mut f = File::create(&centroids_path)?;
+    for c in &centroids {
+        let bytes = unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u8, 64) };
+        f.write_all(bytes)?;
+    }
 
-    File::create(Path::new(output_dir).join("offsets.bin"))?
-        .write_all(unsafe { std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 4) })?;
+    let offsets_path = Path::new(output_dir).join("offsets.bin");
+    let mut f = File::create(&offsets_path)?;
+    for &o in &offsets {
+        f.write_all(&o.to_ne_bytes())?;
+    }
 
     println!("All artifacts created in {}", output_dir);
     Ok(())
@@ -156,18 +153,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn convert_record(jr: JsonRecord) -> Record {
     let mut v = [0.0f32; 16];
-    v[..14].copy_from_slice(&jr.vector);
+    for i in 0..14 { v[i] = jr.vector[i]; }
+    v[14] = 0.0;
     v[15] = if jr.label == "fraud" { 1.0 } else { 0.0 };
-    Record {
-        vector: v,
-    }
+    Record { vector: v }
 }
 
 fn manhattan_distance(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
     let mut sum = 0.0;
-    for i in 0..14 { // Only use first 14 dimensions for distance
-        sum += (v1[i] - v2[i]).abs();
-    }
+    for i in 0..14 { sum += (v1[i] - v2[i]).abs(); }
     sum
 }
-
