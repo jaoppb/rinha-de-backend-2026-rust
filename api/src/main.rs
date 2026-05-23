@@ -111,8 +111,9 @@ fn main() -> std::io::Result<()> {
         // Warm up memory maps
         let mut sum = 0.0f32;
         for r in d.records.iter().take(1000) { sum += r.vector[0] as f32; }
-        for c in i.centroids.iter() { sum += c[0]; }
-        for o in i.offsets.iter() { sum += *o as f32; }
+        for c in i.l1_centroids.iter() { sum += c[0]; }
+        for c in i.l2_centroids.iter().take(1000) { sum += c[0]; }
+        for o in i.offsets.iter().take(1000) { sum += *o as f32; }
         println!("Warmup complete (dummy sum: {})", sum);
 
         let _ = tx.send((l, d, i));

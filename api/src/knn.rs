@@ -2,8 +2,10 @@ use crate::mmap::{IvfData, Record};
 use std::arch::x86_64::*;
 
 const K: usize = 7;
-const N_CENTROIDS: usize = 4096;
-const N_PROBE: usize = 8; // Optimized for <1ms target
+const N_L1: usize = 256;
+const N_L2_PER_L1: usize = 256;
+const N_PROBE_L1: usize = 8;
+const N_PROBE_L2: usize = 32;
 const SCORE_EPS: f32 = 1e-6;
 const APPROVAL_THRESHOLD: f32 = 0.44;
 
@@ -20,7 +22,7 @@ impl IvfIndex {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
-                return unsafe { self.search_avx2(query, records) };
+                return unsafe { self.search_hivf_avx2(query, records) };
             }
         }
         
@@ -29,8 +31,9 @@ impl IvfIndex {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn search_avx2(&self, query: &[f32; 16], records: &[Record]) -> (bool, f32) {
-        let centroids = self.data.centroids;
+    unsafe fn search_hivf_avx2(&self, query: &[f32; 16], records: &[Record]) -> (bool, f32) {
+        let l1_centroids = self.data.l1_centroids;
+        let l2_centroids = self.data.l2_centroids;
         let offsets = self.data.offsets;
 
         let q_low = _mm256_loadu_ps(query.as_ptr());
@@ -38,30 +41,49 @@ impl IvfIndex {
         let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
         let mask_high = _mm256_castsi256_ps(_mm256_set_epi32(0, 0, -1, -1, -1, -1, -1, -1));
 
-        let mut best_probes = [(f32::MAX, 0usize); N_PROBE];
-        
+        // 1. Scan L1 Root
+        let mut best_l1 = [(f32::MAX, 0usize); N_PROBE_L1];
         let mut i = 0;
-        while i + 3 < N_CENTROIDS {
+        while i + 3 < N_L1 {
             let (d0, d1, d2, d3) = self.dist_avx2_preloaded_x4(
                 q_low, q_high, abs_mask, mask_high,
-                &centroids[i], &centroids[i+1], &centroids[i+2], &centroids[i+3]
+                &l1_centroids[i], &l1_centroids[i+1], &l1_centroids[i+2], &l1_centroids[i+3]
             );
-
-            self.update_best_probes(&mut best_probes, d0, i);
-            self.update_best_probes(&mut best_probes, d1, i + 1);
-            self.update_best_probes(&mut best_probes, d2, i + 2);
-            self.update_best_probes(&mut best_probes, d3, i + 3);
-            
+            update_best_probes::<N_PROBE_L1>(&mut best_l1, d0, i);
+            update_best_probes::<N_PROBE_L1>(&mut best_l1, d1, i + 1);
+            update_best_probes::<N_PROBE_L1>(&mut best_l1, d2, i + 2);
+            update_best_probes::<N_PROBE_L1>(&mut best_l1, d3, i + 3);
             i += 4;
         }
 
+        // 2. Scan L2 Leaves for selected L1s
+        let mut best_l2 = [(f32::MAX, 0usize); N_PROBE_L2];
+        for probe_idx in 0..N_PROBE_L1 {
+            let l1_idx = best_l1[probe_idx].1;
+            let l2_base = l1_idx * N_L2_PER_L1;
+            let mut j = 0;
+            while j + 3 < N_L2_PER_L1 {
+                let (d0, d1, d2, d3) = self.dist_avx2_preloaded_x4(
+                    q_low, q_high, abs_mask, mask_high,
+                    &l2_centroids[l2_base + j], &l2_centroids[l2_base + j + 1], 
+                    &l2_centroids[l2_base + j + 2], &l2_centroids[l2_base + j + 3]
+                );
+                update_best_probes::<N_PROBE_L2>(&mut best_l2, d0, l2_base + j);
+                update_best_probes::<N_PROBE_L2>(&mut best_l2, d1, l2_base + j + 1);
+                update_best_probes::<N_PROBE_L2>(&mut best_l2, d2, l2_base + j + 2);
+                update_best_probes::<N_PROBE_L2>(&mut best_l2, d3, l2_base + j + 3);
+                j += 4;
+            }
+        }
+
+        // 3. Scan Records in selected L2 clusters
         let mut top_k = [(f32::MAX, 0u8); K];
         let mut max_dist = f32::MAX;
 
-        for i in 0..N_PROBE {
-            let (_, c_idx) = best_probes[i];
-            let start = offsets[c_idx] as usize;
-            let end = offsets[c_idx + 1] as usize;
+        for probe_idx in 0..N_PROBE_L2 {
+            let l2_idx = best_l2[probe_idx].1;
+            let start = offsets[l2_idx] as usize;
+            let end = offsets[l2_idx + 1] as usize;
             let cluster_records = &records[start..end];
 
             let mut k = 0;
@@ -71,7 +93,8 @@ impl IvfIndex {
                 }
                 let (d0, d1, d2, d3) = self.dist_avx2_preloaded_x4(
                     q_low, q_high, abs_mask, mask_high,
-                    &cluster_records[k].vector, &cluster_records[k+1].vector, &cluster_records[k+2].vector, &cluster_records[k+3].vector
+                    &cluster_records[k].vector, &cluster_records[k+1].vector, 
+                    &cluster_records[k+2].vector, &cluster_records[k+3].vector
                 );
                 if d0 < max_dist { max_dist = update_top_k(&mut top_k, d0, cluster_records[k].vector[15] as u8); }
                 if d1 < max_dist { max_dist = update_top_k(&mut top_k, d1, cluster_records[k+1].vector[15] as u8); }
@@ -89,18 +112,6 @@ impl IvfIndex {
         }
 
         self.calculate_fraud_score(top_k)
-    }
-
-    #[inline(always)]
-    fn update_best_probes(&self, best_probes: &mut [(f32, usize); N_PROBE], dist: f32, idx: usize) {
-        if dist < best_probes[N_PROBE - 1].0 {
-            let mut pos = N_PROBE - 1;
-            while pos > 0 && dist < best_probes[pos - 1].0 {
-                best_probes[pos] = best_probes[pos - 1];
-                pos -= 1;
-            }
-            best_probes[pos] = (dist, idx);
-        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -147,25 +158,33 @@ impl IvfIndex {
     }
 
     fn search_scalar(&self, query: &[f32; 16], records: &[Record]) -> (bool, f32) {
-        let mut best_probes = [(f32::MAX, 0usize); N_PROBE];
-        for i in 0..N_CENTROIDS {
-            let mut sum = 0.0;
-            for j in 0..14 { sum += (query[j] - self.data.centroids[i][j]).abs(); }
-            self.update_best_probes(&mut best_probes, sum, i);
+        let mut best_l1 = [(f32::MAX, 0usize); N_PROBE_L1];
+        for i in 0..N_L1 {
+            let dist = manhattan_distance_scalar(query, &self.data.l1_centroids[i]);
+            update_best_probes::<N_PROBE_L1>(&mut best_l1, dist, i);
         }
+
+        let mut best_l2 = [(f32::MAX, 0usize); N_PROBE_L2];
+        for probe_idx in 0..N_PROBE_L1 {
+            let l1_idx = best_l1[probe_idx].1;
+            let l2_base = l1_idx * N_L2_PER_L1;
+            for j in 0..N_L2_PER_L1 {
+                let dist = manhattan_distance_scalar(query, &self.data.l2_centroids[l2_base + j]);
+                update_best_probes::<N_PROBE_L2>(&mut best_l2, dist, l2_base + j);
+            }
+        }
+
         let mut top_k = [(f32::MAX, 0u8); K];
         let mut max_dist = f32::MAX;
-        for i in 0..N_PROBE {
-            let (_, c_idx) = best_probes[i];
-            let start = self.data.offsets[c_idx] as usize;
-            let end = self.data.offsets[c_idx + 1] as usize;
+        for probe_idx in 0..N_PROBE_L2 {
+            let l2_idx = best_l2[probe_idx].1;
+            let start = self.data.offsets[l2_idx] as usize;
+            let end = self.data.offsets[l2_idx + 1] as usize;
             for record in &records[start..end] {
-                let mut sum = 0.0;
-                for j in 0..14 {
-                    sum += (query[j] - record.vector[j]).abs();
-                    if sum >= max_dist { break; }
+                let dist = manhattan_distance_scalar(query, &record.vector);
+                if dist < max_dist {
+                    max_dist = update_top_k(&mut top_k, dist, record.vector[15] as u8);
                 }
-                if sum < max_dist { max_dist = update_top_k(&mut top_k, sum, record.vector[15] as u8); }
             }
         }
         self.calculate_fraud_score(top_k)
@@ -186,6 +205,18 @@ impl IvfIndex {
 }
 
 #[inline(always)]
+fn update_best_probes<const N: usize>(best: &mut [(f32, usize); N], dist: f32, idx: usize) {
+    if dist < best[N - 1].0 {
+        let mut pos = N - 1;
+        while pos > 0 && dist < best[pos - 1].0 {
+            best[pos] = best[pos - 1];
+            pos -= 1;
+        }
+        best[pos] = (dist, idx);
+    }
+}
+
+#[inline(always)]
 fn update_top_k(top_k: &mut [(f32, u8); K], dist: f32, label: u8) -> f32 {
     let mut pos = K - 1;
     while pos > 0 && dist < top_k[pos - 1].0 {
@@ -194,4 +225,11 @@ fn update_top_k(top_k: &mut [(f32, u8); K], dist: f32, label: u8) -> f32 {
     }
     top_k[pos] = (dist, label);
     top_k[K - 1].0
+}
+
+#[inline(always)]
+fn manhattan_distance_scalar(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
+    let mut sum = 0.0;
+    for i in 0..14 { sum += (v1[i] - v2[i]).abs(); }
+    sum
 }

@@ -28,9 +28,11 @@ pub struct Dataset {
 }
 
 pub struct IvfData {
-    _centroids_mmap: Mmap,
+    _l1_mmap: Mmap,
+    _l2_mmap: Mmap,
     _offsets_mmap: Mmap,
-    pub centroids: &'static [[f32; 16]],
+    pub l1_centroids: &'static [[f32; 16]],
+    pub l2_centroids: &'static [[f32; 16]],
     pub offsets: &'static [u32],
 }
 
@@ -55,16 +57,26 @@ pub fn load_dataset() -> std::io::Result<Dataset> {
 }
 
 pub fn load_ivf_data() -> std::io::Result<IvfData> {
-    let centroids_file = File::open("/app/data/centroids.bin")?;
-    let centroids_mmap = unsafe { Mmap::map(&centroids_file)? };
+    let l1_file = File::open("/app/data/l1_centroids.bin")?;
+    let l1_mmap = unsafe { Mmap::map(&l1_file)? };
+
+    let l2_file = File::open("/app/data/l2_centroids.bin")?;
+    let l2_mmap = unsafe { Mmap::map(&l2_file)? };
 
     let offsets_file = File::open("/app/data/offsets.bin")?;
     let offsets_mmap = unsafe { Mmap::map(&offsets_file)? };
 
-    let centroids = unsafe {
+    let l1_centroids = unsafe {
         std::slice::from_raw_parts(
-            centroids_mmap.as_ptr() as *const [f32; 16],
-            centroids_mmap.len() / std::mem::size_of::<[f32; 16]>(),
+            l1_mmap.as_ptr() as *const [f32; 16],
+            l1_mmap.len() / 64,
+        )
+    };
+
+    let l2_centroids = unsafe {
+        std::slice::from_raw_parts(
+            l2_mmap.as_ptr() as *const [f32; 16],
+            l2_mmap.len() / 64,
         )
     };
 
@@ -73,9 +85,11 @@ pub fn load_ivf_data() -> std::io::Result<IvfData> {
     };
 
     Ok(IvfData {
-        _centroids_mmap: centroids_mmap,
+        _l1_mmap: l1_mmap,
+        _l2_mmap: l2_mmap,
         _offsets_mmap: offsets_mmap,
-        centroids: unsafe { std::mem::transmute(centroids) },
+        l1_centroids: unsafe { std::mem::transmute(l1_centroids) },
+        l2_centroids: unsafe { std::mem::transmute(l2_centroids) },
         offsets: unsafe { std::mem::transmute(offsets) },
     })
 }
