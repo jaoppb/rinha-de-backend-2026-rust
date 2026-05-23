@@ -16,7 +16,7 @@ pub struct Record {
     pub vector: [f32; 16],  // 64 bytes, label stored in vector[15]
 }
 
-const N_CENTROIDS: usize = 2048;
+const N_CENTROIDS: usize = 4096;
 const N_ITERATIONS: usize = 10;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -107,6 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &c_idx in &assignments {
         counts[c_idx as usize] += 1;
     }
+    
+    let max_count = counts.iter().max().unwrap();
+    let min_count = counts.iter().min().unwrap();
+    let avg_count = records.len() as f32 / N_CENTROIDS as f32;
+    println!("Cluster stats: min={}, max={}, avg={:.2}", min_count, max_count, avg_count);
 
     let mut offsets = [0u32; N_CENTROIDS + 1];
     for i in 0..N_CENTROIDS {

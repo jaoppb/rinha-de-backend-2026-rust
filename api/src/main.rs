@@ -107,6 +107,14 @@ fn main() -> std::io::Result<()> {
         let l = load_lookups();
         let d = load_dataset().expect("Failed to load dataset");
         let i = load_ivf_data().expect("Failed to load IVF data");
+        
+        // Warm up memory maps
+        let mut sum = 0.0f32;
+        for r in d.records.iter().take(1000) { sum += r.vector[0]; }
+        for c in i.centroids.iter() { sum += c[0]; }
+        for o in i.offsets.iter() { sum += *o as f32; }
+        println!("Warmup complete (dummy sum: {})", sum);
+
         let _ = tx.send((l, d, i));
     });
 

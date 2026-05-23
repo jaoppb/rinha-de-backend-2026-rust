@@ -2,8 +2,8 @@ use crate::mmap::{IvfData, Record};
 use std::arch::x86_64::*;
 
 const K: usize = 7;
-const N_CENTROIDS: usize = 2048;
-const N_PROBE: usize = 40; // Balanced for accuracy and latency
+const N_CENTROIDS: usize = 4096;
+const N_PROBE: usize = 8; // Optimized for <1ms p99 target
 const SCORE_EPS: f32 = 1e-6;
 const APPROVAL_THRESHOLD: f32 = 0.44;
 
