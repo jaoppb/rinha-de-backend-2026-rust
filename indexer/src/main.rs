@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
+use rand::prelude::*;
 
 #[derive(Deserialize)]
 struct JsonRecord {
@@ -20,6 +21,7 @@ const N_L1: usize = 256;
 const N_L2_PER_L1: usize = 256;
 const N_TOTAL_L2: usize = N_L1 * N_L2_PER_L1;
 const N_ITERATIONS: usize = 10;
+const SOFT_ASSIGNMENT_COUNT: usize = 4; // Map each record to its top 4 nearest L2 clusters
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -31,10 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = &args[2];
 
     println!("Opening input file: {}", input_path);
-    let file = File::open(input_path)?;
+    let mut file_read = File::open(input_path)?;
     
     // Detect GZIP
-    let mut file_read = File::open(input_path)?;
     let mut magic = [0u8; 2];
     let is_gzip = if file_read.read_exact(&mut magic).is_ok() {
         magic == [0x1f, 0x8b]
@@ -42,30 +43,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         false
     };
     
-    let records: Vec<Record> = if is_gzip {
+    let mut records: Vec<Record> = if is_gzip {
         println!("Detected GZIP format");
+        let file = File::open(input_path)?;
         let decoder = GzDecoder::new(file);
         let reader = BufReader::new(decoder);
         let json_records: Vec<JsonRecord> = serde_json::from_reader(reader)?;
         json_records.into_iter().map(convert_record).collect()
     } else {
         println!("Detected plain JSON format");
+        let file = File::open(input_path)?;
         let reader = BufReader::new(file);
         let json_records: Vec<JsonRecord> = serde_json::from_reader(reader)?;
         json_records.into_iter().map(convert_record).collect()
     };
+
+    // Set original record index in padding for de-duplication
+    for (i, r) in records.iter_mut().enumerate() {
+        r.vector[14] = i as f32;
+    }
 
     println!("Successfully loaded {} records", records.len());
     std::fs::create_dir_all(output_dir)?;
 
     // 1. L1 Clustering
     println!("Clustering L1 ({} super-centroids, {} iterations)...", N_L1, N_ITERATIONS);
-    let mut l1_centroids = vec![[0.0f32; 16]; N_L1];
-    let stride = (records.len() / N_L1).max(1);
-    for i in 0..N_L1 {
-        let idx = (i * stride).min(records.len() - 1);
-        l1_centroids[i] = records[idx].vector;
-    }
+    let mut l1_centroids = init_kmeans_plus_plus(&records, N_L1);
 
     let mut l1_assignments = vec![0usize; records.len()];
     train_k_means(&records, &mut l1_centroids, &mut l1_assignments, N_ITERATIONS);
@@ -73,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. L2 Clustering
     println!("Clustering L2 ({} sub-centroids per L1, total {})...", N_L2_PER_L1, N_TOTAL_L2);
     let mut all_l2_centroids = vec![[0.0f32; 16]; N_TOTAL_L2];
-    let mut record_l2_assignments = vec![0usize; records.len()];
+    let mut record_l2_multi_assignments = vec![Vec::with_capacity(2); records.len()];
 
     for l1_idx in 0..N_L1 {
         let l1_record_indices: Vec<usize> = l1_assignments.iter()
@@ -90,24 +93,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|&i| records[i])
             .collect();
 
-        let mut l2_centroids = vec![[0.0f32; 16]; N_L2_PER_L1];
-        let stride = (l1_records.len() / N_L2_PER_L1).max(1);
-        for i in 0..N_L2_PER_L1 {
-            let idx = (i * stride).min(l1_records.len() - 1);
-            l2_centroids[i] = l1_records[idx].vector;
-        }
-
+        let mut l2_centroids = init_kmeans_plus_plus(&l1_records, N_L2_PER_L1);
         let mut l2_assignments = vec![0usize; l1_records.len()];
         train_k_means(&l1_records, &mut l2_centroids, &mut l2_assignments, N_ITERATIONS);
 
-        // Copy back to global L2 centroids and update global record assignments
+        // Copy back to global L2 centroids
         for i in 0..N_L2_PER_L1 {
             all_l2_centroids[l1_idx * N_L2_PER_L1 + i] = l2_centroids[i];
         }
 
-        for (local_idx, &l2_idx) in l2_assignments.iter().enumerate() {
+        // Soft Assignment: Map each record in this L1 to top clusters
+        for (local_idx, record) in l1_records.iter().enumerate() {
+            let mut dists: Vec<(f32, usize)> = l2_centroids.iter()
+                .enumerate()
+                .map(|(c_idx, c)| (manhattan_distance(&record.vector, c), c_idx))
+                .collect();
+            
+            dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
             let global_record_idx = l1_record_indices[local_idx];
-            record_l2_assignments[global_record_idx] = l1_idx * N_L2_PER_L1 + l2_idx;
+            for i in 0..SOFT_ASSIGNMENT_COUNT.min(dists.len()) {
+                record_l2_multi_assignments[global_record_idx].push(l1_idx * N_L2_PER_L1 + dists[i].1);
+            }
         }
 
         if l1_idx % 32 == 0 {
@@ -118,22 +125,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Write artifacts
     println!("Writing artifacts...");
     
-    // Sort records by L2 cluster
-    let mut indexed_assignments: Vec<(usize, usize)> = record_l2_assignments.iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, c)| (c, i))
-        .collect();
+    // Flatten record multi-assignments into (cluster_idx, record_idx) pairs
+    let mut flat_assignments = Vec::with_capacity(records.len() * 2);
+    for (r_idx, clusters) in record_l2_multi_assignments.iter().enumerate() {
+        for &c_idx in clusters {
+            flat_assignments.push((c_idx, r_idx));
+        }
+    }
     
-    indexed_assignments.sort_by_key(|&(c, _)| c);
+    // Sort by cluster index for contiguous disk access in API
+    flat_assignments.sort_by_key(|&(c, _)| c);
     
     let mut offsets = vec![0u32; N_TOTAL_L2 + 1];
     let mut current_offset = 0;
-    let mut final_records = Vec::with_capacity(records.len());
+    let mut final_records = Vec::with_capacity(flat_assignments.len());
     
     let mut current_c = 0;
     offsets[0] = 0;
-    for (c, i) in indexed_assignments {
+    for (c, i) in flat_assignments {
         while current_c < c {
             current_c += 1;
             offsets[current_c] = current_offset;
@@ -173,8 +182,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         f.write_all(&o.to_ne_bytes())?;
     }
 
-    println!("All artifacts created in {}", output_dir);
+    println!("All artifacts created in {}. Final dataset size: {} records (Soft Assignment)", 
+        output_dir, final_records.len());
     Ok(())
+}
+
+fn init_kmeans_plus_plus(records: &[Record], n_clusters: usize) -> Vec<[f32; 16]> {
+    if records.is_empty() { return vec![[0.0; 16]; n_clusters]; }
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut centroids = Vec::with_capacity(n_clusters);
+
+    // 1. Pick first centroid at random
+    let first_idx = rng.gen_range(0..records.len());
+    centroids.push(records[first_idx].vector);
+
+    // 2. Pick remaining centroids
+    let mut min_dists = vec![f32::MAX; records.len()];
+    for _ in 1..n_clusters {
+        let last_centroid = centroids.last().unwrap();
+        let mut total_dist = 0.0;
+        
+        for (i, record) in records.iter().enumerate() {
+            let d = manhattan_distance(&record.vector, last_centroid);
+            if d < min_dists[i] {
+                min_dists[i] = d;
+            }
+            total_dist += min_dists[i] * min_dists[i]; // Probability proportional to distance squared
+        }
+
+        let mut threshold = rng.r#gen::<f32>() * total_dist;
+        let mut chosen_idx = records.len() - 1;
+        for (i, &d) in min_dists.iter().enumerate() {
+            threshold -= d * d;
+            if threshold <= 0.0 {
+                chosen_idx = i;
+                break;
+            }
+        }
+        centroids.push(records[chosen_idx].vector);
+    }
+
+    centroids
 }
 
 fn train_k_means(records: &[Record], centroids: &mut [[f32; 16]], assignments: &mut [usize], iterations: usize) {
@@ -216,7 +264,7 @@ fn train_k_means(records: &[Record], centroids: &mut [[f32; 16]], assignments: &
 fn convert_record(jr: JsonRecord) -> Record {
     let mut v = [0.0f32; 16];
     for i in 0..14 { v[i] = jr.vector[i]; }
-    v[14] = 0.0;
+    v[14] = 0.0; // Will be set to original index in main loop
     v[15] = if jr.label == "fraud" { 1.0 } else { 0.0 };
     Record { vector: v }
 }
