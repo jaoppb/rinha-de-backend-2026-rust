@@ -16,6 +16,8 @@ This skill automates the execution and data collection of performance benchmarks
     - Capture the full output of the `make monitor` command or `benchmark_suite.sh`.
     - Review `test_stats.log` (generated in verbose mode) for operation-level timing.
     - Focus on latency metrics (p99) from k6 output and `avg_us` per operation.
+5. **Plan Mode Transition**: Once data is collected, automatically enter Plan Mode.
+6. **Analysis & Suggestions**: Analyze the benchmark data and suggest concrete architectural or code-level improvements based on the findings.
 
 ## Data Collection Pattern
 
