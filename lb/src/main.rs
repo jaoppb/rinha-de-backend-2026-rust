@@ -114,6 +114,7 @@ fn main() -> std::io::Result<()> {
                         continue;
                     }
 
+                    let request_start = std::time::Instant::now();
                     let accept_to_handoff_timer = logging::timer_start();
                     set_tcp_nodelay(client_fd);
 
@@ -121,7 +122,7 @@ fn main() -> std::io::Result<()> {
                     let upstream_idx = rr % up_addrs.len();
                     rr = rr.wrapping_add(1);
 
-                    let handoff_ok = send_fd(uds_fd, target_addr, client_fd);
+                    let handoff_ok = send_fd(uds_fd, target_addr, client_fd, request_start);
                     logging::log_timing(
                         if handoff_ok { Level::Info } else { Level::Warn },
                         Category::Request,
@@ -148,7 +149,7 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int) -> bool {
+fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int, start: std::time::Instant) -> bool {
     unsafe {
         let mut msg: libc::msghdr = mem::zeroed();
         msg.msg_name = addr as *const _ as *mut libc::c_void;
@@ -177,8 +178,22 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
             return false;
         }
 
-        let res = libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL);
-        res >= 0
+        loop {
+            let res = libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL);
+            if res >= 0 {
+                return true;
+            }
+            let err = std::io::Error::last_os_error().raw_os_error();
+            if err == Some(libc::EWOULDBLOCK) || err == Some(libc::EAGAIN) {
+                if start.elapsed() >= std::time::Duration::from_millis(2) {
+                    break;
+                }
+                std::thread::yield_now();
+                continue;
+            }
+            break;
+        }
+        false
     }
 }
 

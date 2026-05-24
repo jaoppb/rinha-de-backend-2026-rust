@@ -101,7 +101,8 @@ impl IvfIndex {
         }
 
         let (best_l2_unsorted, _, _) = dists_l2.select_nth_unstable_by(N_PROBE_L2_EXTENDED, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        best_l2_unsorted.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let (best_l2_first_256, _, _) = best_l2_unsorted.select_nth_unstable_by(N_PROBE_L2, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        best_l2_first_256.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let best_l2 = best_l2_unsorted;
 
         // 3. Scan Records in top 256 clusters
@@ -256,7 +257,8 @@ impl IvfIndex {
         }
 
         let (best_l2_unsorted, _, _) = dists_l2.select_nth_unstable_by(N_PROBE_L2_EXTENDED, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        best_l2_unsorted.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let (best_l2_first_256, _, _) = best_l2_unsorted.select_nth_unstable_by(N_PROBE_L2, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        best_l2_first_256.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let best_l2 = best_l2_unsorted;
 
         let mut top_k = [(f32::MAX, 0u8, 0usize); K];
