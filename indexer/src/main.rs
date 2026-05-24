@@ -24,7 +24,7 @@ const N_TOTAL_L2: usize = N_L1 * N_L2_PER_L1;
 const N_ITERATIONS: usize = 20;
 
 static FEATURE_WEIGHTS: [f32; 16] = [
-    1.2, 0.8, 1.0, 0.5, 0.5, 0.3, 0.3, 1.0, 1.2, 1.5, 0.7, 1.0, 1.0, 2.0, 0.0, 0.0,
+    1.0038165, 0.665417, 0.8668326, 0.5379362, 0.5, 0.3, 0.3701757, 1.0, 1.2, 1.2648705, 0.81239825, 1.051987, 0.8247206, 2.0315619, 0.0, 0.0,
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -72,6 +72,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Successfully loaded {} records", records.len());
     std::fs::create_dir_all(output_dir)?;
+
+    if args.len() > 3 && args[3] == "tune" {
+        run_tuning_loop(&records);
+        return Ok(());
+    }
 
     // 1. L1 Clustering
     println!("Clustering L1 ({} super-centroids, {} iterations)...", N_L1, N_ITERATIONS);
@@ -254,6 +259,105 @@ fn train_k_means(records: &[Record], centroids: &mut [[f32; 16]], assignments: &
                 }
                 centroids[i] = new_centroids[i];
             }
+        }
+    }
+}
+
+fn run_tuning_loop(records: &[Record]) {
+    println!("Starting Weight Tuning (Brute Force Mode)...");
+    let val_count = 5000;
+    let mut rng = StdRng::seed_from_u64(42);
+    
+    // Reservoir Sample for Validation Set
+    let mut val_indices: Vec<usize> = (0..records.len()).collect();
+    val_indices.shuffle(&mut rng);
+    let val_set: Vec<Record> = val_indices[0..val_count].iter().map(|&i| records[i]).collect();
+    let ref_set: Vec<Record> = records.iter().enumerate()
+        .filter(|(i, _)| !val_indices[0..val_count].contains(i))
+        .map(|(_, &r)| r).collect();
+
+    println!("Validation Set: {} records | Reference Set: {} records", val_set.len(), ref_set.len());
+
+    let mut current_weights = FEATURE_WEIGHTS;
+    let mut best_mcc = -1.0;
+    let mut best_weights = current_weights;
+
+    for iteration in 0..1000 {
+        let candidate_weights = if iteration == 0 {
+            current_weights
+        } else {
+            let mut w = best_weights;
+            // Randomly mutate 1-3 weights
+            for _ in 0..rng.gen_range(1..=3) {
+                let idx = rng.gen_range(0..14);
+                let mutation = rng.gen_range(0.8..1.2);
+                w[idx] *= mutation;
+            }
+            w
+        };
+
+        // Evaluation (Parallel Brute Force)
+        let results: Vec<(f32, u8)> = val_set.par_iter().map(|val_record| {
+            let mut top_k = [(f32::MAX, 0u8); 7]; // (dist, label)
+            let query = &val_record.vector;
+
+            for ref_record in &ref_set {
+                let mut dist = 0.0;
+                for i in 0..14 {
+                    dist += (query[i] - ref_record.vector[i]).abs() * candidate_weights[i];
+                }
+                
+                if dist < top_k[6].0 {
+                    let mut pos = 6;
+                    while pos > 0 && dist < top_k[pos - 1].0 {
+                        top_k[pos] = top_k[pos - 1];
+                        pos -= 1;
+                    }
+                    let packed = ref_record.vector[15].to_bits();
+                    let label = (packed & 1) as u8;
+                    top_k[pos] = (dist, label);
+                }
+            }
+
+            // Calculate Fraud Score (Weighted)
+            let mut fraud_weight = 0.0;
+            let mut total_weight = 0.0;
+            for &(d, l) in &top_k {
+                let weight = (-d * 0.5).exp();
+                total_weight += weight;
+                fraud_weight += weight * l as f32;
+            }
+            let score = if total_weight > 0.0 { fraud_weight / total_weight } else { 0.0 };
+            let packed_val = val_record.vector[15].to_bits();
+            let true_label = (packed_val & 1) as u8;
+            (score, true_label)
+        }).collect();
+
+        // Calculate MCC (Matthews Correlation Coefficient)
+        let mut tp = 0.0; let mut tn = 0.0; let mut fp = 0.0; let mut fn_ = 0.0;
+        let threshold = 0.44; // Matches APPROVAL_THRESHOLD
+        for (score, true_label) in results {
+            let predicted = if score >= threshold { 1 } else { 0 };
+            match (predicted, true_label) {
+                (1, 1) => tp += 1.0,
+                (0, 0) => tn += 1.0,
+                (1, 0) => fp += 1.0,
+                (0, 1) => fn_ += 1.0,
+                _ => unreachable!(),
+            }
+        }
+
+        let mcc = if (tp + fp) * (tp + fn_) * (tn + fp) * (tn + fn_) == 0.0 {
+            0.0
+        } else {
+            (tp * tn - fp * fn_) / ((tp + fp) * (tp + fn_) * (tn + fp) * (tn + fn_) as f32).sqrt()
+        };
+
+        if mcc > best_mcc {
+            best_mcc = mcc;
+            best_weights = candidate_weights;
+            println!("Iter {:4}: New Best MCC: {:.4} | FP: {:3} | FN: {:3} | Weights: {:?}", 
+                iteration, best_mcc, fp as usize, fn_ as usize, best_weights);
         }
     }
 }

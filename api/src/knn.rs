@@ -14,22 +14,7 @@ const CONFIDENCE_THRESHOLD_HIGH: f32 = 0.50;
 
 // Feature weights for the 14 features (0-13). 14 and 15 are metadata.
 static FEATURE_WEIGHTS: [f32; 16] = [
-    1.2, // 0: ln(1 + amount)
-    0.8, // 1: installments
-    1.0, // 2: amount_vs_avg_ratio
-    0.5, // 3: hour_sin
-    0.5, // 4: hour_cos
-    0.3, // 5: day_sin
-    0.3, // 6: day_cos
-    1.0, // 7: ln(1 + minutes_since_last_tx)
-    1.2, // 8: km_from_last_tx
-    1.5, // 9: km_from_home
-    0.7, // 10: tx_count_24h
-    2.5, // 11: Packed Binary (is_online, card_present, unknown_merchant)
-    2.0, // 12: mcc_risk
-    1.0, // 13: merchant_avg_amount
-    0.0, // 14: Padding
-    0.0, // 15: Packed ID & Label
+    1.0038165, 0.665417, 0.8668326, 0.5379362, 0.5, 0.3, 0.3701757, 1.0, 1.2, 1.2648705, 0.81239825, 1.051987, 0.8247206, 2.0315619, 0.0, 0.0,
 ];
 
 pub struct IvfIndex {
