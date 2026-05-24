@@ -5,15 +5,15 @@ description: Automates the full benchmarking workflow for the Rinha de Backend 2
 
 # Benchmark Runner
 
-This skill automates the execution and data collection of performance benchmarks using the automated monitor script.
+This skill automates the execution and data collection of performance benchmarks using targets defined in the Makefile.
 
 ## Workflow
 
-1. **Baseline Run (Non-Verbose)**: Execute `make build-release && make monitor` to measure raw performance without logging overhead.
-2. **Analysis Run (Verbose)**: Execute `make build-release-verbose && make monitor` to collect granular operation-level timing statistics.
-3. **Automated Suite**: Alternatively, use `scripts/benchmark_suite.sh` to run both sequentially and aggregate results.
+1. **Ask the User**: Before running any benchmarks, use the `ask_question` tool to ask the user which type of benchmark test to execute. Provide the following options based on the `Makefile` targets: `smoke`, `test`, `test-thermal`, `test-sustained`, `test-saturation`, and `test-spike`.
+2. **Baseline Run (Non-Verbose)**: Execute `make build-release` followed by `make <selected-test>` (or run them together if appropriate) to measure raw performance without logging overhead.
+3. **Analysis Run (Verbose)**: Execute `make build-release-verbose` followed by `make <selected-test>` to collect granular operation-level timing statistics.
 4. **Collect Data**:
-    - Capture the full output of the `make monitor` command or `benchmark_suite.sh`.
+    - Capture the full output of the executed `make <selected-test>` command.
     - Review `test_stats.log` (generated in verbose mode) for operation-level timing.
     - Focus on latency metrics (p99) from k6 output and `avg_us` per operation.
 5. **Plan Mode Transition**: Once data is collected, automatically enter Plan Mode.

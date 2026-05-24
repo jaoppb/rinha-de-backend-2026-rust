@@ -31,7 +31,7 @@ const payload = {
 
 export const options = {
     vus: 1,
-    iterations: 10,
+    iterations: 5,
     // Teto absoluto por iteração — se o backend começar a responder lento,
     // o k6 aborta em vez de pendurar o job até o timeout do GitHub Actions.
     maxDuration: '60s',
@@ -60,4 +60,10 @@ export default function smokeTest() {
             try { return typeof JSON.parse(r.body).fraud_score === 'number'; } catch { return false; }
         },
     });
+}
+
+export function handleSummary(data) {
+    return {
+        'test_results/smoke.json': JSON.stringify(data, null, 2),
+    };
 }

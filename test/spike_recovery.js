@@ -1,82 +1,102 @@
+// spike_recovery.js — Spike intencional + medição de tempo de recuperação.
+//
+// Objetivo: sobrecarregar o sistema até ele começar a degradar e então medir
+// quanto tempo leva para o p99 voltar ao baseline após a carga cair.
+//
+// Se o p99 não voltar a <20ms nos 60s de recovery, há state acumulado:
+//   - GC Go com backlog de objetos não coletados (GOGC alto demais?)
+//   - epoll backlog não drena (fds pendentes no queue)
+//   - mmap pages evicted pelo OS durante o pico (page faults no recovery)
+//
+// Stages:
+//   0-30s:  baseline 500 req/s (warm)
+//   30-45s: ramping rápido → 3000 req/s (sobrecarga intencional)
+//   45-75s: sustenta 3000 req/s (sistema sob pressão máxima)
+//   75-80s: queda brusca → 200 req/s
+//   80-140s: recovery — o p99 volta ao baseline? Em quanto tempo?
+//
+// Execute: k6 run test/spike_recovery.js
+// NÃO modifica test.js (proibido pela organização).
+
 import http from 'k6/http';
-import { check } from 'k6';
 import { SharedArray } from 'k6/data';
 import { Counter } from 'k6/metrics';
 import { textSummary } from './k6-summary.js';
 import exec from 'k6/execution';
 
 const testData = new SharedArray('test-data', function () {
-    return JSON.parse(open('./test-data.json')).entries;
+	return JSON.parse(open('./test-data.json')).entries;
 });
 const statsArr = new SharedArray('test-stats', function () {
-    return [JSON.parse(open('./test-data.json')).stats];
+	return [JSON.parse(open('./test-data.json')).stats];
 });
 const expectedStats = statsArr[0];
 
-const tpCount = new Counter('tp_count');
-const tnCount = new Counter('tn_count');
-const fpCount = new Counter('fp_count');
-const fnCount = new Counter('fn_count');
+const tpCount    = new Counter('tp_count');
+const tnCount    = new Counter('tn_count');
+const fpCount    = new Counter('fp_count');
+const fnCount    = new Counter('fn_count');
 const errorCount = new Counter('error_count');
 
 export const options = {
-    summaryTrendStats: ['p(99)'],
-    systemTags: ['status', 'method'],
-    dns: {
-        ttl: '5m',
-        select: 'roundRobin',
-    },
-    scenarios: {
-        default: {
-            executor: 'ramping-arrival-rate',
-            startRate: 1,
-            timeUnit: '1s',
-            preAllocatedVUs: 100,
-            maxVUs: 250,
-            gracefulStop: '10s',
-            stages: [
-                { duration: '120s', target: 900 },
-            ],
-        },
-    },
+	summaryTrendStats: ['p(50)', 'p(95)', 'p(99)', 'p(99.9)', 'max'],
+	systemTags: ['status', 'method'],
+	dns: { ttl: '5m', select: 'roundRobin' },
+	scenarios: {
+		spike: {
+			executor: 'ramping-arrival-rate',
+			startRate: 500,
+			timeUnit: '1s',
+			preAllocatedVUs: 300,
+			maxVUs: 6000,
+			gracefulStop: '15s',
+			stages: [
+				{ duration: '30s', target: 500  }, // Baseline aquecido
+				{ duration: '15s', target: 3000 }, // Spike rápido (sobrecarga)
+				{ duration: '30s', target: 3000 }, // Sustenta o spike
+				{ duration: '5s',  target: 200  }, // Queda brusca
+				{ duration: '60s', target: 200  }, // Recovery — p99 volta?
+			],
+		},
+	},
 };
 
 export function setup() {
-    console.log(
-        `Dataset: ${expectedStats.total} entries, `
-        + `${expectedStats.fraud_count} fraud (${expectedStats.fraud_rate}%), `
-        + `${expectedStats.legit_count} legit (${expectedStats.legit_rate}%), `
-        + `edge cases: ${expectedStats.edge_case_rate}%`
-    );
+	console.log(
+		`[spike_recovery] Dataset: ${expectedStats.total} entries\n` +
+		`Stages: 30s baseline → 15s spike 3000/s → 30s sustain → 5s queda → 60s recovery`,
+	);
+	console.log('Meta: p99 < 20ms nos últimos 30s de recovery');
 }
 
 export default function () {
-    const idx = exec.scenario.iterationInTest;
-    if (idx >= testData.length) return;
-    const entry = testData[idx];
-    const expectedApproved = entry.expected_approved;
+	const idx   = exec.scenario.iterationInTest % testData.length;
+	const entry = testData[idx];
+	const expectedApproved = entry.expected_approved;
 
-    const res = http.post(
-        'http://localhost:9999/fraud-score',
-        JSON.stringify(entry.request),
-        { headers: { 'Content-Type': 'application/json' }, timeout: '2001ms' }
-    );
+	const res = http.post(
+		'http://localhost:9999/fraud-score',
+		JSON.stringify(entry.request),
+		{ headers: { 'Content-Type': 'application/json' }, timeout: '2001ms' },
+	);
 
-    if (res.status === 200) {
-        const body = JSON.parse(res.body);
-        // Per-request scoring: compare against expectedApproved
-        // expectedApproved === true  --> legit transaction
-        // expectedApproved === false --> fraud transaction
-        if (expectedApproved === body.approved) {
-            if (body.approved) tnCount.add(1); // correctly approved legit
-            else tpCount.add(1);               // correctly denied fraud
-        } else {
-            if (body.approved) fnCount.add(1); // fraud approved (missed fraud)
-            else fpCount.add(1);               // legit denied (false block)
-        }
-    } else {
-        errorCount.add(1);
-    }
+	const elapsed = Date.now() - exec.scenario.startTime;
+	if (elapsed > 80000 && res.timings.duration > 10) {
+		console.warn(`[RECOVERY ALERT] Latency still high during recovery: ${res.timings.duration}ms at ${Math.round(elapsed/1000)}s`);
+	}
+
+	if (res.status === 200) {
+		const body = JSON.parse(res.body);
+		if (expectedApproved === body.approved) {
+			if (body.approved) tnCount.add(1);
+			else               tpCount.add(1);
+		} else {
+			if (body.approved) fnCount.add(1);
+			else               fpCount.add(1);
+		}
+	} else {
+		errorCount.add(1);
+	}
 }
 
 export function handleSummary(data) {
@@ -140,6 +160,7 @@ export function handleSummary(data) {
     const finalScore = p99Score + detScore;
 
     const result = {
+        scenario: 'spike_recovery',
         expected: expectedStats,
         p99: r(p99, PRECISION) + 'ms',
         scoring: {
@@ -178,7 +199,7 @@ export function handleSummary(data) {
     };
 
     return {
-        'test_results/default.json': JSON.stringify(result, null, 2),
-        //stdout: textSummary(data, { indent: ' ', enableColors: true }),
+        'test_results/spike.json': JSON.stringify(result, null, 2),
+        stdout: textSummary(data, { indent: ' ', enableColors: true }),
     };
 }

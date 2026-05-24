@@ -1,0 +1,160 @@
+services:
+  k6:
+    image: grafana/k6:latest
+    user: root
+    environment:
+      - K6_NO_USAGE_REPORT=true
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: run test/test.js
+    network_mode: "host"
+    profiles:
+      - test
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    storage_opt:
+      size: "1T"
+
+  k6-smoke:
+    image: grafana/k6:latest
+    user: root
+    environment:
+      - K6_NO_USAGE_REPORT=true
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: run test/smoke.js
+    network_mode: "host"
+    profiles:
+      - smoke
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    storage_opt:
+      size: "1T"
+
+  thermal:
+    image: grafana/k6:latest
+    user: root
+    environment:
+      - K6_NO_USAGE_REPORT=true
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: run test/cache_thermal.js
+    network_mode: "host"
+    profiles:
+      - thermal
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    storage_opt:
+      size: "1T"
+
+  heavy:
+    image: grafana/k6:latest
+    user: root
+    environment:
+      - K6_NO_USAGE_REPORT=true
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: run test/heavyTests.js
+    network_mode: "host"
+    profiles:
+      - heavy
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    storage_opt:
+      size: "1T"
+
+  precision:
+    image: grafana/k6:latest
+    user: root
+    environment:
+      - K6_NO_USAGE_REPORT=true
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: run test/precision_probe.js
+    network_mode: "host"
+    profiles:
+      - precision
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    storage_opt:
+      size: "1T"
+
+  saturation:
+    image: grafana/k6:latest
+    user: root
+    environment:
+      - K6_NO_USAGE_REPORT=true
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: run test/saturation_finder.js
+    network_mode: "host"
+    profiles:
+      - saturation
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    storage_opt:
+      size: "1T"
+
+  spike:
+    image: grafana/k6:latest
+    user: root
+    environment:
+      - K6_NO_USAGE_REPORT=true
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: run test/spike_recovery.js
+    network_mode: "host"
+    profiles:
+      - spike
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    storage_opt:
+      size: "1T"
+
+  sustained:
+    image: grafana/k6:latest
+    user: root
+    environment:
+      - K6_NO_USAGE_REPORT=true
+    volumes:
+      - ..:/app
+    working_dir: /app
+    command: run test/stress_sustained.js
+    network_mode: "host"
+    profiles:
+      - sustained
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    storage_opt:
+      size: "1T"

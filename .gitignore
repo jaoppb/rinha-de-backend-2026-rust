@@ -7,5 +7,8 @@ test_stats.log
 benchmark_results/
 benchmark_logs.json
 .gemini/
+.agents/
 data/*.bin
 data/offsets.bin
+test_results/
+*.skill

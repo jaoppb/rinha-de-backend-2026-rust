@@ -1,82 +1,97 @@
+// saturation_finder.js — Escalonamento granular para encontrar o ponto de saturação.
+//
+// Objetivo: descobrir em qual req/s o p99 ultrapassa 10ms ou o failure_rate
+// ultrapassa 0.5%. Cada stage tem 60s de estabilização antes de subir.
+//
+// O heavyTests.js atual vai de 0→4000 em 10s — rápido demais para medir
+// o ponto de saturação com precisão. Aqui cada patamar tem 60s de steady state.
+//
+// Execute: k6 run test/saturation_finder.js
+// NÃO modifica test.js (proibido pela organização).
+
 import http from 'k6/http';
-import { check } from 'k6';
 import { SharedArray } from 'k6/data';
 import { Counter } from 'k6/metrics';
 import { textSummary } from './k6-summary.js';
 import exec from 'k6/execution';
 
 const testData = new SharedArray('test-data', function () {
-    return JSON.parse(open('./test-data.json')).entries;
+	return JSON.parse(open('./test-data.json')).entries;
 });
 const statsArr = new SharedArray('test-stats', function () {
-    return [JSON.parse(open('./test-data.json')).stats];
+	return [JSON.parse(open('./test-data.json')).stats];
 });
 const expectedStats = statsArr[0];
 
-const tpCount = new Counter('tp_count');
-const tnCount = new Counter('tn_count');
-const fpCount = new Counter('fp_count');
-const fnCount = new Counter('fn_count');
+const tpCount    = new Counter('tp_count');
+const tnCount    = new Counter('tn_count');
+const fpCount    = new Counter('fp_count');
+const fnCount    = new Counter('fn_count');
 const errorCount = new Counter('error_count');
 
 export const options = {
-    summaryTrendStats: ['p(99)'],
-    systemTags: ['status', 'method'],
-    dns: {
-        ttl: '5m',
-        select: 'roundRobin',
-    },
-    scenarios: {
-        default: {
-            executor: 'ramping-arrival-rate',
-            startRate: 1,
-            timeUnit: '1s',
-            preAllocatedVUs: 100,
-            maxVUs: 250,
-            gracefulStop: '10s',
-            stages: [
-                { duration: '120s', target: 900 },
-            ],
-        },
-    },
+	// Estatísticas granulares para identificar o ponto exato de saturação
+	summaryTrendStats: ['p(50)', 'p(95)', 'p(99)', 'p(99.9)', 'max', 'avg'],
+	systemTags: ['status', 'method'],
+	dns: { ttl: '5m', select: 'roundRobin' },
+	scenarios: {
+		// Escalonamento em 7 stages, cada um com 60s de steady state.
+		// Total: ~7 minutos. Rate máximo: 2000 req/s.
+		// Ajuste maxVUs se o host não tiver CPU suficiente para tantas goroutines k6.
+		ramp: {
+			executor: 'ramping-arrival-rate',
+			startRate: 200,
+			timeUnit: '1s',
+			preAllocatedVUs: 200,
+			maxVUs: 4000,
+			stages: [
+				{ duration: '60s', target: 400  }, // Stage 1 — 400 req/s
+				{ duration: '60s', target: 600  }, // Stage 2 — 600 req/s
+				{ duration: '60s', target: 800  }, // Stage 3 — 800 req/s
+				{ duration: '60s', target: 1000 }, // Stage 4 — 1000 req/s
+				{ duration: '60s', target: 1200 }, // Stage 5 — 1200 req/s
+				{ duration: '60s', target: 1500 }, // Stage 6 — 1500 req/s
+				{ duration: '60s', target: 2000 }, // Stage 7 — 2000 req/s (stress)
+			],
+		},
+	},
 };
 
 export function setup() {
-    console.log(
-        `Dataset: ${expectedStats.total} entries, `
-        + `${expectedStats.fraud_count} fraud (${expectedStats.fraud_rate}%), `
-        + `${expectedStats.legit_count} legit (${expectedStats.legit_rate}%), `
-        + `edge cases: ${expectedStats.edge_case_rate}%`
-    );
+	console.log(
+		`[saturation_finder] Dataset: ${expectedStats.total} entries — ` +
+		`ramping 200→2000 req/s in 7 stages of 60s each`,
+	);
+	console.log('Monitore o p99 por stage — saturação = p99 > 10ms ou failure_rate > 0.5%');
 }
 
 export default function () {
-    const idx = exec.scenario.iterationInTest;
-    if (idx >= testData.length) return;
-    const entry = testData[idx];
-    const expectedApproved = entry.expected_approved;
+	const idx = exec.scenario.iterationInTest % testData.length;
+	const entry = testData[idx];
+	const expectedApproved = entry.expected_approved;
 
-    const res = http.post(
-        'http://localhost:9999/fraud-score',
-        JSON.stringify(entry.request),
-        { headers: { 'Content-Type': 'application/json' }, timeout: '2001ms' }
-    );
+	const res = http.post(
+		'http://localhost:9999/fraud-score',
+		JSON.stringify(entry.request),
+		{ headers: { 'Content-Type': 'application/json' }, timeout: '2001ms' },
+	);
 
-    if (res.status === 200) {
-        const body = JSON.parse(res.body);
-        // Per-request scoring: compare against expectedApproved
-        // expectedApproved === true  --> legit transaction
-        // expectedApproved === false --> fraud transaction
-        if (expectedApproved === body.approved) {
-            if (body.approved) tnCount.add(1); // correctly approved legit
-            else tpCount.add(1);               // correctly denied fraud
-        } else {
-            if (body.approved) fnCount.add(1); // fraud approved (missed fraud)
-            else fpCount.add(1);               // legit denied (false block)
-        }
-    } else {
-        errorCount.add(1);
-    }
+	if (res.timings.duration > 10) {
+		console.warn(`[LATENCY ALERT] High latency detected at iteration ${exec.scenario.iterationInTest}. Duration: ${res.timings.duration}ms`);
+	}
+
+	if (res.status === 200) {
+		const body = JSON.parse(res.body);
+		if (expectedApproved === body.approved) {
+			if (body.approved) tnCount.add(1);
+			else               tpCount.add(1);
+		} else {
+			if (body.approved) fnCount.add(1);
+			else               fpCount.add(1);
+		}
+	} else {
+		errorCount.add(1);
+	}
 }
 
 export function handleSummary(data) {
@@ -140,8 +155,26 @@ export function handleSummary(data) {
     const finalScore = p99Score + detScore;
 
     const result = {
+        scenario: 'saturation_finder',
         expected: expectedStats,
         p99: r(p99, PRECISION) + 'ms',
+        diagnostics: {
+            http_req_waiting: {
+                p95: r(reqWaiting['p(95)'] || 0, PRECISION),
+                p99: r(reqWaiting['p(99)'] || 0, PRECISION),
+                p999: r(reqWaiting['p(99.9)'] || 0, PRECISION),
+            },
+            http_req_connecting: {
+                p95: r(reqConnecting['p(95)'] || 0, PRECISION),
+                p99: r(reqConnecting['p(99)'] || 0, PRECISION),
+                p999: r(reqConnecting['p(99.9)'] || 0, PRECISION),
+            },
+            http_req_tls_handshaking: {
+                p95: r(reqTlsHandshaking['p(95)'] || 0, PRECISION),
+                p99: r(reqTlsHandshaking['p(99)'] || 0, PRECISION),
+                p999: r(reqTlsHandshaking['p(99.9)'] || 0, PRECISION),
+            }
+        },
         scoring: {
             breakdown: {
                 false_positive_detections: fp,
@@ -178,7 +211,7 @@ export function handleSummary(data) {
     };
 
     return {
-        'test_results/default.json': JSON.stringify(result, null, 2),
-        //stdout: textSummary(data, { indent: ' ', enableColors: true }),
+        'test_results/saturation.json': JSON.stringify(result, null, 2),
+        stdout: textSummary(data, { indent: ' ', enableColors: true }),
     };
 }
