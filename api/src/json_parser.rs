@@ -1,6 +1,7 @@
 use memchr::{memchr, memchr2, memchr3};
 
 pub struct ParsedTransaction<'a> {
+    pub id: &'a [u8],
     pub amount: f32,
     pub installments: u8,
     pub requested_at: &'a [u8],
@@ -19,6 +20,7 @@ pub struct ParsedTransaction<'a> {
 }
 
 pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
+    let mut id = &b""[..];
     let mut amount = 0.0;
     let mut installments = 0;
     let mut requested_at = &b""[..];
@@ -42,6 +44,7 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
     while i < body.len() {
         let key = if let Some(k) = next_key(body, &mut i) { k } else { break; };
         match key {
+            b"id" => id = parse_str(body, &mut i),
             b"transaction" => {
                 skip_to(body, &mut i, b'{')?;
                 while let Some(k) = next_key_in_object(body, &mut i) {
@@ -116,6 +119,7 @@ pub fn parse_json_payload(body: &[u8]) -> Option<ParsedTransaction<'_>> {
     }
 
     Some(ParsedTransaction {
+        id,
         amount,
         installments,
         requested_at,

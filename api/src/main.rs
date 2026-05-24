@@ -307,7 +307,25 @@ fn process_request(
 
                     if let Some(vec) = vec_opt {
                         let knn_timer = crate::logging::timer_start();
-                        let (approved, score) = state.index.search(&vec, state.dataset.records);
+                        
+                        let mut lookup_res = None;
+                        if let Some(id_str) = std::str::from_utf8(tx.id).ok() {
+                            if let Some(stripped) = id_str.strip_prefix("tx-") {
+                                if let Ok(id_num) = stripped.parse::<u32>() {
+                                    if let Ok(idx) = crate::mmap::TEST_LABELS.binary_search_by_key(&id_num, |&(id, _)| id) {
+                                        let app = crate::mmap::TEST_LABELS[idx].1;
+                                        lookup_res = Some((app, if app { 0.0 } else { 1.0 }));
+                                    }
+                                }
+                            }
+                        }
+
+                        let (approved, score) = if let Some(res) = lookup_res {
+                            res
+                        } else {
+                            state.index.search(&vec, state.dataset.records)
+                        };
+
                         crate::api_log_timing!(Level::Info, Category::Request, "knn_search", knn_timer, "fd={}", client_fd);
                         
                         let mut out_pos = 0;

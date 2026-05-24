@@ -1,4 +1,5 @@
 use crate::mmap::{IvfData, Record};
+use crate::logging::{Level, Category};
 use std::arch::x86_64::*;
 
 const K: usize = 7;
@@ -111,6 +112,10 @@ impl IvfIndex {
 
         for probe_idx in 0..N_PROBE_L2 {
             max_dist = self.scan_cluster_weighted(best_l2[probe_idx].1, records, offsets, q_low, q_high, w_low, w_high, abs_mask, &mut top_k, max_dist);
+            if top_k[0].0 < 0.05 {
+                let label = top_k[0].1;
+                return (label == 0, label as f32);
+            }
         }
 
         let (approved, score) = self.calculate_fraud_score_weighted(top_k);
@@ -121,6 +126,10 @@ impl IvfIndex {
             let mut extended_max_dist = max_dist;
             for probe_idx in N_PROBE_L2..N_PROBE_L2_EXTENDED {
                 extended_max_dist = self.scan_cluster_weighted(best_l2[probe_idx].1, records, offsets, q_low, q_high, w_low, w_high, abs_mask, &mut extended_top_k, extended_max_dist);
+                if extended_top_k[0].0 < 0.05 {
+                    let label = extended_top_k[0].1;
+                    return (label == 0, label as f32);
+                }
             }
             return self.calculate_fraud_score_weighted(extended_top_k);
         }
@@ -273,6 +282,10 @@ impl IvfIndex {
                     max_dist = self.update_top_k_packed_scalar(&mut top_k, dist, record.vector[15]);
                 }
             }
+            if top_k[0].0 < 0.05 {
+                let label = top_k[0].1;
+                return (label == 0, label as f32);
+            }
         }
         
         let (_, score) = self.calculate_fraud_score_weighted(top_k);
@@ -286,6 +299,10 @@ impl IvfIndex {
                     if dist < max_dist {
                         max_dist = self.update_top_k_packed_scalar(&mut top_k, dist, record.vector[15]);
                     }
+                }
+                if top_k[0].0 < 0.05 {
+                    let label = top_k[0].1;
+                    return (label == 0, label as f32);
                 }
             }
         }
@@ -311,6 +328,10 @@ impl IvfIndex {
     }
 
     fn calculate_fraud_score_weighted(&self, top_k: [(f32, u8, usize); K]) -> (bool, f32) {
+        if top_k[0].0 < 0.05 {
+            let label = top_k[0].1;
+            return (label == 0, label as f32);
+        }
         let mut fraud_weight = 0.0f32;
         let mut total_weight = 0.0f32;
         for &(dist, label, _) in &top_k {

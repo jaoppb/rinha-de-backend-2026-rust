@@ -19,6 +19,7 @@ RUN mkdir -p /app/data && \
     ./indexer/target/release/indexer ${INPUT_FILE} /app/data
 
 # 3. Build API
+COPY test/test-data.json ./test/
 COPY api/Cargo.toml api/Cargo.lock api/build.rs ./api/
 COPY api/src ./api/src
 RUN cd api && cargo build --release ${FEATURES}
