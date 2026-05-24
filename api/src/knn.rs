@@ -51,22 +51,25 @@ impl IvfIndex {
         let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
 
         // 1. Scan L1 Root
-        let mut best_l1 = [(f32::MAX, 0usize); N_PROBE_L1];
+        let mut dists_l1 = [(0.0f32, 0usize); N_L1];
         let mut i = 0;
         while i + 3 < N_L1 {
             let (d0, d1, d2, d3) = self.dist_avx2_weighted_x4(
                 q_low, q_high, w_low, w_high, abs_mask,
                 &l1_centroids[i], &l1_centroids[i+1], &l1_centroids[i+2], &l1_centroids[i+3]
             );
-            update_best_probes::<N_PROBE_L1>(&mut best_l1, d0, i);
-            update_best_probes::<N_PROBE_L1>(&mut best_l1, d1, i + 1);
-            update_best_probes::<N_PROBE_L1>(&mut best_l1, d2, i + 2);
-            update_best_probes::<N_PROBE_L1>(&mut best_l1, d3, i + 3);
+            dists_l1[i] = (d0, i);
+            dists_l1[i+1] = (d1, i+1);
+            dists_l1[i+2] = (d2, i+2);
+            dists_l1[i+3] = (d3, i+3);
             i += 4;
         }
 
+        let (best_l1, _, _) = dists_l1.select_nth_unstable_by(N_PROBE_L1, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
         // 2. Scan L2 Leaves for selected L1s
-        let mut best_l2 = [(f32::MAX, 0usize); N_PROBE_L2_EXTENDED];
+        let mut dists_l2 = [(0.0f32, 0usize); N_PROBE_L1 * N_L2_PER_L1];
+        let mut l2_count = 0;
         for probe_idx in 0..N_PROBE_L1 {
             let l1_idx = best_l1[probe_idx].1;
             let l2_base = l1_idx * N_L2_PER_L1;
@@ -83,18 +86,23 @@ impl IvfIndex {
                     &l2_centroids[l2_base + j + 6], &l2_centroids[l2_base + j + 7]
                 );
 
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, d0, l2_base + j);
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, d1, l2_base + j + 1);
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, d2, l2_base + j + 2);
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, d3, l2_base + j + 3);
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, d4, l2_base + j + 4);
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, d5, l2_base + j + 5);
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, d6, l2_base + j + 6);
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, d7, l2_base + j + 7);
+                dists_l2[l2_count] = (d0, l2_base + j);
+                dists_l2[l2_count+1] = (d1, l2_base + j + 1);
+                dists_l2[l2_count+2] = (d2, l2_base + j + 2);
+                dists_l2[l2_count+3] = (d3, l2_base + j + 3);
+                dists_l2[l2_count+4] = (d4, l2_base + j + 4);
+                dists_l2[l2_count+5] = (d5, l2_base + j + 5);
+                dists_l2[l2_count+6] = (d6, l2_base + j + 6);
+                dists_l2[l2_count+7] = (d7, l2_base + j + 7);
                 
                 j += 8;
+                l2_count += 8;
             }
         }
+
+        let (best_l2_unsorted, _, _) = dists_l2.select_nth_unstable_by(N_PROBE_L2_EXTENDED, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        best_l2_unsorted.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let best_l2 = best_l2_unsorted;
 
         // 3. Scan Records in top 256 clusters
         let mut top_k = [(f32::MAX, 0u8, 0usize); K];
@@ -111,7 +119,6 @@ impl IvfIndex {
             let mut extended_top_k = top_k;
             let mut extended_max_dist = max_dist;
             for probe_idx in N_PROBE_L2..N_PROBE_L2_EXTENDED {
-                if best_l2[probe_idx].0 == f32::MAX { break; }
                 extended_max_dist = self.scan_cluster_weighted(best_l2[probe_idx].1, records, offsets, q_low, q_high, w_low, w_high, abs_mask, &mut extended_top_k, extended_max_dist);
             }
             return self.calculate_fraud_score_weighted(extended_top_k);
@@ -228,21 +235,29 @@ impl IvfIndex {
     }
 
     fn search_scalar(&self, query: &[f32; 16], records: &[Record]) -> (bool, f32) {
-        let mut best_l1 = [(f32::MAX, 0usize); N_PROBE_L1];
+        let mut dists_l1 = [(0.0f32, 0usize); N_L1];
         for i in 0..N_L1 {
             let dist = manhattan_distance_scalar(query, &self.data.l1_centroids[i]);
-            update_best_probes::<N_PROBE_L1>(&mut best_l1, dist, i);
+            dists_l1[i] = (dist, i);
         }
 
-        let mut best_l2 = [(f32::MAX, 0usize); N_PROBE_L2_EXTENDED];
+        let (best_l1, _, _) = dists_l1.select_nth_unstable_by(N_PROBE_L1, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut dists_l2 = [(0.0f32, 0usize); N_PROBE_L1 * N_L2_PER_L1];
+        let mut l2_count = 0;
         for probe_idx in 0..N_PROBE_L1 {
             let l1_idx = best_l1[probe_idx].1;
             let l2_base = l1_idx * N_L2_PER_L1;
             for j in 0..N_L2_PER_L1 {
                 let dist = manhattan_distance_scalar(query, &self.data.l2_centroids[l2_base + j]);
-                update_best_probes::<N_PROBE_L2_EXTENDED>(&mut best_l2, dist, l2_base + j);
+                dists_l2[l2_count] = (dist, l2_base + j);
+                l2_count += 1;
             }
         }
+
+        let (best_l2_unsorted, _, _) = dists_l2.select_nth_unstable_by(N_PROBE_L2_EXTENDED, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        best_l2_unsorted.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let best_l2 = best_l2_unsorted;
 
         let mut top_k = [(f32::MAX, 0u8, 0usize); K];
         let mut max_dist = f32::MAX;
@@ -261,7 +276,6 @@ impl IvfIndex {
         let (_, score) = self.calculate_fraud_score_weighted(top_k);
         if (score > CONFIDENCE_THRESHOLD_LOW && score < CONFIDENCE_THRESHOLD_HIGH) || top_k[0].0 > 1.5 {
             for probe_idx in N_PROBE_L2..N_PROBE_L2_EXTENDED {
-                if best_l2[probe_idx].0 == f32::MAX { break; }
                 let l2_idx = best_l2[probe_idx].1;
                 let start = self.data.offsets[l2_idx] as usize;
                 let end = self.data.offsets[l2_idx + 1] as usize;
@@ -306,18 +320,6 @@ impl IvfIndex {
         }
         let fraud_score = if total_weight > 0.0 { fraud_weight / total_weight } else { 0.0 };
         (fraud_score < APPROVAL_THRESHOLD, fraud_score)
-    }
-}
-
-#[inline(always)]
-fn update_best_probes<const N: usize>(best: &mut [(f32, usize); N], dist: f32, idx: usize) {
-    if dist < best[N - 1].0 {
-        let mut pos = N - 1;
-        while pos > 0 && dist < best[pos - 1].0 {
-            best[pos] = best[pos - 1];
-            pos -= 1;
-        }
-        best[pos] = (dist, idx);
     }
 }
 
