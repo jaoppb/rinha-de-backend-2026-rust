@@ -78,6 +78,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Pre-multiply records by feature weights for faster distance calculation at runtime.
+    // This allows the inner loop to skip 14 multiplication operations per distance calculation.
+    println!("Pre-weighting records...");
+    for r in records.iter_mut() {
+        for i in 0..14 {
+            r.vector[i] *= FEATURE_WEIGHTS[i];
+        }
+    }
+
     // 1. L1 Clustering
     println!("Clustering L1 ({} super-centroids, {} iterations)...", N_L1, N_ITERATIONS);
     let mut l1_centroids = init_kmeans_plus_plus(&records, N_L1);
@@ -424,7 +433,7 @@ fn convert_record(jr: JsonRecord) -> Record {
 fn manhattan_distance_weighted(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
     let mut sum = 0.0;
     for i in 0..14 { 
-        sum += (v1[i] - v2[i]).abs() * FEATURE_WEIGHTS[i]; 
+        sum += (v1[i] - v2[i]).abs(); 
     }
     sum
 }

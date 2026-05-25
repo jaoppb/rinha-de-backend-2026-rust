@@ -28,14 +28,19 @@ impl IvfIndex {
     }
 
     pub fn search(&self, query: &[f32; 16], records: &[Record]) -> (bool, f32) {
+        let mut weighted_query = *query;
+        for i in 0..14 {
+            weighted_query[i] *= FEATURE_WEIGHTS[i];
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
-                return unsafe { self.search_hivf_avx2(query, records) };
+                return unsafe { self.search_hivf_avx2(&weighted_query, records) };
             }
         }
         
-        self.search_scalar(query, records)
+        self.search_scalar(&weighted_query, records)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -47,16 +52,14 @@ impl IvfIndex {
 
         let q_low = _mm256_loadu_ps(query.as_ptr());
         let q_high = _mm256_loadu_ps(query.as_ptr().add(8));
-        let w_low = _mm256_loadu_ps(FEATURE_WEIGHTS.as_ptr());
-        let w_high = _mm256_loadu_ps(FEATURE_WEIGHTS.as_ptr().add(8));
         let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
 
         // 1. Scan L1 Root
         let mut dists_l1 = [(0.0f32, 0usize); N_L1];
         let mut i = 0;
         while i + 3 < N_L1 {
-            let (d0, d1, d2, d3) = self.dist_avx2_weighted_x4(
-                q_low, q_high, w_low, w_high, abs_mask,
+            let (d0, d1, d2, d3) = self.dist_avx2_x4(
+                q_low, q_high, abs_mask,
                 &l1_centroids[i], &l1_centroids[i+1], &l1_centroids[i+2], &l1_centroids[i+3]
             );
             dists_l1[i] = (d0, i);
@@ -76,13 +79,13 @@ impl IvfIndex {
             let l2_base = l1_idx * N_L2_PER_L1;
             let mut j = 0;
             while j + 7 < N_L2_PER_L1 {
-                let (d0, d1, d2, d3) = self.dist_avx2_weighted_x4(
-                    q_low, q_high, w_low, w_high, abs_mask,
+                let (d0, d1, d2, d3) = self.dist_avx2_x4(
+                    q_low, q_high, abs_mask,
                     &l2_centroids[l2_base + j], &l2_centroids[l2_base + j + 1], 
                     &l2_centroids[l2_base + j + 2], &l2_centroids[l2_base + j + 3]
                 );
-                let (d4, d5, d6, d7) = self.dist_avx2_weighted_x4(
-                    q_low, q_high, w_low, w_high, abs_mask,
+                let (d4, d5, d6, d7) = self.dist_avx2_x4(
+                    q_low, q_high, abs_mask,
                     &l2_centroids[l2_base + j + 4], &l2_centroids[l2_base + j + 5], 
                     &l2_centroids[l2_base + j + 6], &l2_centroids[l2_base + j + 7]
                 );
@@ -111,7 +114,7 @@ impl IvfIndex {
         let mut max_dist = f32::MAX;
 
         for probe_idx in 0..N_PROBE_L2 {
-            max_dist = self.scan_cluster_weighted(best_l2[probe_idx].1, records, offsets, q_low, q_high, w_low, w_high, abs_mask, &mut top_k, max_dist);
+            max_dist = self.scan_cluster(best_l2[probe_idx].1, records, offsets, q_low, q_high, abs_mask, &mut top_k, max_dist);
             if top_k[0].0 < 0.05 {
                 let label = top_k[0].1;
                 return (label == 0, label as f32);
@@ -125,7 +128,7 @@ impl IvfIndex {
             let mut extended_top_k = top_k;
             let mut extended_max_dist = max_dist;
             for probe_idx in N_PROBE_L2..N_PROBE_L2_EXTENDED {
-                extended_max_dist = self.scan_cluster_weighted(best_l2[probe_idx].1, records, offsets, q_low, q_high, w_low, w_high, abs_mask, &mut extended_top_k, extended_max_dist);
+                extended_max_dist = self.scan_cluster(best_l2[probe_idx].1, records, offsets, q_low, q_high, abs_mask, &mut extended_top_k, extended_max_dist);
                 if extended_top_k[0].0 < 0.05 {
                     let label = extended_top_k[0].1;
                     return (label == 0, label as f32);
@@ -139,15 +142,13 @@ impl IvfIndex {
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn scan_cluster_weighted(
+    unsafe fn scan_cluster(
         &self,
         l2_idx: usize,
         records: &[Record],
         offsets: &[u32],
         q_low: __m256,
         q_high: __m256,
-        w_low: __m256,
-        w_high: __m256,
         abs_mask: __m256,
         top_k: &mut [(f32, u8, usize); K],
         mut max_dist: f32
@@ -157,24 +158,38 @@ impl IvfIndex {
         let cluster_records = &records[start..end];
 
         let mut k = 0;
-        while k + 3 < cluster_records.len() {
-            if k + 12 < cluster_records.len() {
-                _mm_prefetch(cluster_records[k + 12].vector.as_ptr() as *const i8, _MM_HINT_T0);
+        while k + 7 < cluster_records.len() {
+            if k + 24 < cluster_records.len() {
+                _mm_prefetch(cluster_records.as_ptr().add(k + 24) as *const i8, _MM_HINT_T0);
             }
-            let (d0, d1, d2, d3) = self.dist_avx2_weighted_x4(
-                q_low, q_high, w_low, w_high, abs_mask,
-                &cluster_records[k].vector, &cluster_records[k+1].vector, 
-                &cluster_records[k+2].vector, &cluster_records[k+3].vector
+            let (d0, d1, d2, d3) = self.dist_avx2_x4(
+                q_low, q_high, abs_mask,
+                &cluster_records.get_unchecked(k).vector,
+                &cluster_records.get_unchecked(k+1).vector,
+                &cluster_records.get_unchecked(k+2).vector,
+                &cluster_records.get_unchecked(k+3).vector
             );
+            if d0 < max_dist { max_dist = self.update_top_k_packed(top_k, d0, cluster_records.get_unchecked(k).vector[15]); }
+            if d1 < max_dist { max_dist = self.update_top_k_packed(top_k, d1, cluster_records.get_unchecked(k+1).vector[15]); }
+            if d2 < max_dist { max_dist = self.update_top_k_packed(top_k, d2, cluster_records.get_unchecked(k+2).vector[15]); }
+            if d3 < max_dist { max_dist = self.update_top_k_packed(top_k, d3, cluster_records.get_unchecked(k+3).vector[15]); }
 
-            if d0 < max_dist { max_dist = self.update_top_k_packed(top_k, d0, cluster_records[k].vector[15]); }
-            if d1 < max_dist { max_dist = self.update_top_k_packed(top_k, d1, cluster_records[k+1].vector[15]); }
-            if d2 < max_dist { max_dist = self.update_top_k_packed(top_k, d2, cluster_records[k+2].vector[15]); }
-            if d3 < max_dist { max_dist = self.update_top_k_packed(top_k, d3, cluster_records[k+3].vector[15]); }
-            k += 4;
+            let (d4, d5, d6, d7) = self.dist_avx2_x4(
+                q_low, q_high, abs_mask,
+                &cluster_records.get_unchecked(k+4).vector,
+                &cluster_records.get_unchecked(k+5).vector,
+                &cluster_records.get_unchecked(k+6).vector,
+                &cluster_records.get_unchecked(k+7).vector
+            );
+            if d4 < max_dist { max_dist = self.update_top_k_packed(top_k, d4, cluster_records.get_unchecked(k+4).vector[15]); }
+            if d5 < max_dist { max_dist = self.update_top_k_packed(top_k, d5, cluster_records.get_unchecked(k+5).vector[15]); }
+            if d6 < max_dist { max_dist = self.update_top_k_packed(top_k, d6, cluster_records.get_unchecked(k+6).vector[15]); }
+            if d7 < max_dist { max_dist = self.update_top_k_packed(top_k, d7, cluster_records.get_unchecked(k+7).vector[15]); }
+            
+            k += 8;
         }
         while k < cluster_records.len() {
-            let dist = self.dist_avx2_weighted(q_low, q_high, w_low, w_high, abs_mask, &cluster_records[k].vector);
+            let dist = self.dist_avx2(q_low, q_high, abs_mask, &cluster_records[k].vector);
             if dist < max_dist {
                 max_dist = self.update_top_k_packed(top_k, dist, cluster_records[k].vector[15]);
             }
@@ -202,18 +217,18 @@ impl IvfIndex {
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn dist_avx2_weighted(&self, q_low: __m256, q_high: __m256, w_low: __m256, w_high: __m256, abs_mask: __m256, v2: &[f32; 16]) -> f32 {
+    unsafe fn dist_avx2(&self, q_low: __m256, q_high: __m256, abs_mask: __m256, v2: &[f32; 16]) -> f32 {
         let b_low = _mm256_loadu_ps(v2.as_ptr());
         let b_high = _mm256_loadu_ps(v2.as_ptr().add(8));
-        let diff_low = _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b_low), abs_mask), w_low);
-        let diff_high = _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b_high), abs_mask), w_high);
+        let diff_low = _mm256_and_ps(_mm256_sub_ps(q_low, b_low), abs_mask);
+        let diff_high = _mm256_and_ps(_mm256_sub_ps(q_high, b_high), abs_mask);
         let sum_vec = _mm256_add_ps(diff_low, diff_high);
         self.hsum_avx2(sum_vec)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn dist_avx2_weighted_x4(&self, q_low: __m256, q_high: __m256, w_low: __m256, w_high: __m256, abs_mask: __m256, v0: &[f32; 16], v1: &[f32; 16], v2: &[f32; 16], v3: &[f32; 16]) -> (f32, f32, f32, f32) {
+    unsafe fn dist_avx2_x4(&self, q_low: __m256, q_high: __m256, abs_mask: __m256, v0: &[f32; 16], v1: &[f32; 16], v2: &[f32; 16], v3: &[f32; 16]) -> (f32, f32, f32, f32) {
         let b0_low = _mm256_loadu_ps(v0.as_ptr());
         let b1_low = _mm256_loadu_ps(v1.as_ptr());
         let b2_low = _mm256_loadu_ps(v2.as_ptr());
@@ -223,12 +238,20 @@ impl IvfIndex {
         let b2_high = _mm256_loadu_ps(v2.as_ptr().add(8));
         let b3_high = _mm256_loadu_ps(v3.as_ptr().add(8));
         
-        let s0 = _mm256_add_ps(_mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b0_low), abs_mask), w_low), _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b0_high), abs_mask), w_high));
-        let s1 = _mm256_add_ps(_mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b1_low), abs_mask), w_low), _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b1_high), abs_mask), w_high));
-        let s2 = _mm256_add_ps(_mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b2_low), abs_mask), w_low), _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b2_high), abs_mask), w_high));
-        let s3 = _mm256_add_ps(_mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b3_low), abs_mask), w_low), _mm256_mul_ps(_mm256_and_ps(_mm256_sub_ps(q_high, b3_high), abs_mask), w_high));
+        let s0 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b0_low), abs_mask), _mm256_and_ps(_mm256_sub_ps(q_high, b0_high), abs_mask));
+        let s1 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b1_low), abs_mask), _mm256_and_ps(_mm256_sub_ps(q_high, b1_high), abs_mask));
+        let s2 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b2_low), abs_mask), _mm256_and_ps(_mm256_sub_ps(q_high, b2_high), abs_mask));
+        let s3 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b3_low), abs_mask), _mm256_and_ps(_mm256_sub_ps(q_high, b3_high), abs_mask));
+
+        let sum01 = _mm256_hadd_ps(s0, s1);
+        let sum23 = _mm256_hadd_ps(s2, s3);
+        let sum0123 = _mm256_hadd_ps(sum01, sum23);
+        let low128 = _mm256_castps256_ps128(sum0123);
+        let high128 = _mm256_extractf128_ps(sum0123, 1);
+        let final_sums = _mm_add_ps(low128, high128);
         
-        (self.hsum_avx2(s0), self.hsum_avx2(s1), self.hsum_avx2(s2), self.hsum_avx2(s3))
+        let arr: [f32; 4] = std::mem::transmute(final_sums);
+        (arr[0], arr[1], arr[2], arr[3])
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -350,7 +373,7 @@ impl IvfIndex {
 fn manhattan_distance_scalar(v1: &[f32; 16], v2: &[f32; 16]) -> f32 {
     let mut sum = 0.0;
     for i in 0..14 { 
-        sum += (v1[i] - v2[i]).abs() * FEATURE_WEIGHTS[i]; 
+        sum += (v1[i] - v2[i]).abs(); 
     }
     sum
 }
