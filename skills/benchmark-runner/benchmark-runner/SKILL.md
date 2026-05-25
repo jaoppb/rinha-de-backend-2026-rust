@@ -16,8 +16,9 @@ This skill automates the execution and data collection of performance benchmarks
     - Capture the full output of the executed `make <selected-test>` command.
     - Review `test_stats.log` (generated in verbose mode) for operation-level timing.
     - Focus on latency metrics (p99) from k6 output and `avg_us` per operation.
-5. **Plan Mode Transition**: Once data is collected, automatically enter Plan Mode.
-6. **Analysis & Suggestions**: Analyze the benchmark data and suggest concrete architectural or code-level improvements based on the findings.
+5. **Wait for Model Switch**: Prompt the user to change the active model (e.g., from a fast execution model like Gemini 3.5 Flash back to a reasoning/analysis model like Gemini 3.5 Pro) and wait for the model change before entering Plan Mode or starting the planning phase.
+6. **Plan Mode Transition**: Once the model has been switched, enter Plan Mode.
+7. **Analysis & Suggestions**: Analyze the benchmark data and suggest concrete architectural or code-level improvements based on the findings.
 
 ## Data Collection Pattern
 
