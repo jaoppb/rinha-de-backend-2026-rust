@@ -155,7 +155,7 @@ fn main() -> std::io::Result<()> {
         }
 
         // Prioritize UDS processing: bound it to prevent starvation of existing requests
-        let mut uds_budget = 16;
+        let mut uds_budget = 64;
         while uds_budget > 0 {
             uds_budget -= 1;
             unsafe {
@@ -172,9 +172,6 @@ fn main() -> std::io::Result<()> {
                 {
                     let client_fd = *(libc::CMSG_DATA(cmsg) as *mut libc::c_int);
                     if (client_fd as usize) < MAX_FDS {
-                        let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
-                        libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-
                         let mut buf = free_bufs.pop().unwrap_or_else(|| Box::new([0u8; BUF_SIZE]));
                         let mut pos = 0;
                         let started_at = crate::logging::timer_start();
@@ -199,6 +196,8 @@ fn main() -> std::io::Result<()> {
                             };
                         }
                     } else {
+                        const RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        libc::send(client_fd, RESPONSE.as_ptr() as *const libc::c_void, RESPONSE.len(), libc::MSG_NOSIGNAL);
                         libc::close(client_fd);
                     }
                 }

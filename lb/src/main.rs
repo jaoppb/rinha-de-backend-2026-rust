@@ -10,6 +10,71 @@ use logging::{Category, Level};
 
 const LISTENER: Token = Token(0);
 
+struct Upstream {
+    fd: RawFd,
+    queue: [RawFd; 1024],
+    head: usize,
+    tail: usize,
+    registered_writable: bool,
+}
+
+impl Upstream {
+    fn new(path: &str) -> std::io::Result<Self> {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
+        if fd < 0 { return Err(std::io::Error::last_os_error()); }
+        let sndbuf: libc::c_int = 16 * 1024 * 1024;
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &sndbuf as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
+        }
+
+        let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let c_path = CString::new(path).unwrap();
+        let path_bytes = c_path.as_bytes();
+        let copy_len = path_bytes.len().min(addr.sun_path.len() - 1);
+        unsafe {
+            ptr::copy_nonoverlapping(path_bytes.as_ptr(), addr.sun_path.as_mut_ptr() as *mut u8, copy_len);
+        }
+
+        // We use connect so EPOLLOUT correctly tracks the target's receive queue
+        unsafe {
+            libc::connect(fd, &addr as *const _ as *const libc::sockaddr, mem::size_of::<libc::sockaddr_un>() as libc::socklen_t);
+        }
+
+        Ok(Self {
+            fd,
+            queue: [0; 1024],
+            head: 0,
+            tail: 0,
+            registered_writable: false,
+        })
+    }
+
+    fn push(&mut self, client_fd: RawFd) -> bool {
+        let next_tail = (self.tail + 1) % 1024;
+        if next_tail == self.head { return false; } // full
+        self.queue[self.tail] = client_fd;
+        self.tail = next_tail;
+        true
+    }
+    
+    fn pop(&mut self) -> Option<RawFd> {
+        if self.head == self.tail { return None; }
+        let fd = self.queue[self.head];
+        self.head = (self.head + 1) % 1024;
+        Some(fd)
+    }
+    
+    fn peek(&self) -> Option<RawFd> {
+        if self.head == self.tail { return None; }
+        Some(self.queue[self.head])
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+}
+
 fn main() -> std::io::Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
@@ -18,13 +83,13 @@ fn main() -> std::io::Result<()> {
     let upstream_str = std::env::var("UPSTREAMS")
         .unwrap_or_else(|_| "/data/shared/api1.sock,/data/shared/api2.sock".to_string());
 
-    let upstreams: Vec<String> = upstream_str
+    let upstream_list: Vec<String> = upstream_str
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    if upstreams.is_empty() {
+    if upstream_list.is_empty() {
         logging::log(
             Level::Warn,
             Category::IoUring,
@@ -33,21 +98,9 @@ fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
-    let mut up_addrs = Vec::with_capacity(upstreams.len());
-    for ups in upstreams {
-        let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let c_path = CString::new(ups.as_str()).unwrap();
-        let path_bytes = c_path.as_bytes();
-        let copy_len = path_bytes.len().min(addr.sun_path.len() - 1);
-        unsafe {
-            ptr::copy_nonoverlapping(
-                path_bytes.as_ptr(),
-                addr.sun_path.as_mut_ptr() as *mut u8,
-                copy_len,
-            );
-        }
-        up_addrs.push(addr);
+    let mut upstreams = Vec::with_capacity(upstream_list.len());
+    for ups in upstream_list {
+        upstreams.push(Upstream::new(&ups)?);
     }
 
     let listener_fd = create_listener(9999, 8192)?;
@@ -60,30 +113,14 @@ fn main() -> std::io::Result<()> {
         Interest::READABLE,
     )?;
 
-    let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
-    if uds_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let sndbuf: libc::c_int = 16 * 1024 * 1024;
-    unsafe {
-        libc::setsockopt(
-            uds_fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &sndbuf as *const _ as *const libc::c_void,
-            mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-
     eprintln!(
-        "Single-threaded mio LB listening on 0.0.0.0:9999 handing off to {} upstreams",
-        up_addrs.len()
+        "Single-threaded mio LB listening on 0.0.0.0:9999 handing off to {} upstreams (Async Queuing)",
+        upstreams.len()
     );
     logging::log(
         Level::Info,
         Category::IoUring,
-        &format!("LB started, {} upstreams configured", up_addrs.len()),
+        &format!("LB started, {} upstreams configured", upstreams.len()),
     );
 
     let mut rr = 0;
@@ -92,8 +129,16 @@ fn main() -> std::io::Result<()> {
         poll.poll(&mut events, None)?;
 
         for event in events.iter() {
-            if event.token() == LISTENER {
+            let token = event.token();
+            
+            if token == LISTENER {
+                let mut accept_budget = 128;
                 loop {
+                    if accept_budget == 0 {
+                        break;
+                    }
+                    accept_budget -= 1;
+
                     let mut client_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
                     let mut client_addr_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
                     
@@ -114,46 +159,104 @@ fn main() -> std::io::Result<()> {
                         continue;
                     }
 
-                    let request_start = std::time::Instant::now();
                     let accept_to_handoff_timer = logging::timer_start();
                     set_tcp_nodelay(client_fd);
 
-                    let target_addr = &up_addrs[rr % up_addrs.len()];
-                    let upstream_idx = rr % up_addrs.len();
+                    let target_idx = rr % upstreams.len();
                     rr = rr.wrapping_add(1);
-
-                    let handoff_ok = send_fd(uds_fd, target_addr, client_fd, request_start);
-                    logging::log_timing(
-                        if handoff_ok { Level::Info } else { Level::Warn },
-                        Category::Request,
-                        "accept_to_handoff",
-                        accept_to_handoff_timer,
-                        format_args!(
-                            "fd={} upstream={} result={}",
-                            client_fd,
-                            upstream_idx,
-                            if handoff_ok { "ok" } else { "fallback_503" }
-                        ),
-                    );
-
-                    if !handoff_ok {
-                        send_service_unavailable(client_fd);
+                    
+                    let upstream = &mut upstreams[target_idx];
+                    let mut handoff_ok = false;
+                    let mut queued = false;
+                    
+                    if upstream.is_empty() {
+                        match try_send_fd(upstream.fd, client_fd) {
+                            Ok(()) => {
+                                handoff_ok = true;
+                            }
+                            Err(e) => {
+                                if e.raw_os_error() == Some(libc::EWOULDBLOCK) || e.raw_os_error() == Some(libc::EAGAIN) {
+                                    // Fall through to push
+                                } else {
+                                    send_service_unavailable(client_fd);
+                                    unsafe { libc::close(client_fd); }
+                                    continue;
+                                }
+                            }
+                        }
                     }
-
-                    unsafe {
-                        libc::close(client_fd);
+                    
+                    if handoff_ok {
+                        logging::log_timing(
+                            Level::Info,
+                            Category::Request,
+                            "accept_to_handoff",
+                            accept_to_handoff_timer,
+                            format_args!("fd={} upstream={} result=ok", client_fd, target_idx),
+                        );
+                        unsafe { libc::close(client_fd); }
+                    } else {
+                        if upstream.push(client_fd) {
+                            queued = true;
+                            if !upstream.registered_writable {
+                                poll.registry().register(
+                                    &mut SourceFd(&upstream.fd),
+                                    Token(target_idx + 1),
+                                    Interest::WRITABLE,
+                                ).ok();
+                                upstream.registered_writable = true;
+                            }
+                        } else {
+                            send_service_unavailable(client_fd);
+                            unsafe { libc::close(client_fd); }
+                        }
+                        
+                        logging::log_timing(
+                            if queued { Level::Info } else { Level::Warn },
+                            Category::Request,
+                            "accept_to_handoff",
+                            accept_to_handoff_timer,
+                            format_args!("fd={} upstream={} result={}", client_fd, target_idx, if queued { "queued" } else { "queue_full" }),
+                        );
                     }
+                }
+            } else {
+                // Writable event on an upstream
+                let target_idx = token.0 - 1;
+                let upstream = &mut upstreams[target_idx];
+                
+                while let Some(client_fd) = upstream.peek() {
+                    match try_send_fd(upstream.fd, client_fd) {
+                        Ok(()) => {
+                            upstream.pop();
+                            unsafe { libc::close(client_fd); }
+                        }
+                        Err(e) => {
+                            if e.raw_os_error() == Some(libc::EWOULDBLOCK) || e.raw_os_error() == Some(libc::EAGAIN) {
+                                break;
+                            } else {
+                                upstream.pop();
+                                send_service_unavailable(client_fd);
+                                unsafe { libc::close(client_fd); }
+                            }
+                        }
+                    }
+                }
+                
+                if upstream.is_empty() && upstream.registered_writable {
+                    poll.registry().deregister(&mut SourceFd(&upstream.fd)).ok();
+                    upstream.registered_writable = false;
                 }
             }
         }
     }
 }
 
-fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int, start: std::time::Instant) -> bool {
+fn try_send_fd(sock: libc::c_int, fd_to_send: libc::c_int) -> Result<(), std::io::Error> {
     unsafe {
         let mut msg: libc::msghdr = mem::zeroed();
-        msg.msg_name = addr as *const _ as *mut libc::c_void;
-        msg.msg_namelen = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        msg.msg_name = ptr::null_mut();
+        msg.msg_namelen = 0;
 
         let mut iov = libc::iovec {
             iov_base: "1".as_ptr() as *mut libc::c_void,
@@ -175,25 +278,15 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int,
             *data = fd_to_send;
             msg.msg_controllen = (*cmsg).cmsg_len;
         } else {
-            return false;
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
 
-        loop {
-            let res = libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL);
-            if res >= 0 {
-                return true;
-            }
-            let err = std::io::Error::last_os_error().raw_os_error();
-            if err == Some(libc::EWOULDBLOCK) || err == Some(libc::EAGAIN) {
-                if start.elapsed() >= std::time::Duration::from_millis(2) {
-                    break;
-                }
-                std::thread::yield_now();
-                continue;
-            }
-            break;
+        let res = libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL);
+        if res >= 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
         }
-        false
     }
 }
 
@@ -244,17 +337,13 @@ fn create_listener(port: u16, backlog: i32) -> std::io::Result<RawFd> {
     };
     if rc < 0 {
         let err = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
+        unsafe { libc::close(fd); }
         return Err(err);
     }
 
     if unsafe { libc::listen(fd, backlog) } < 0 {
         let err = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
+        unsafe { libc::close(fd); }
         return Err(err);
     }
 
