@@ -37,6 +37,8 @@ enum ConnState {
         started_at: Timer,
         route: &'static str,
         status: u16,
+        leftover_pos: usize,
+        leftover_len: usize,
     },
 }
 
@@ -181,22 +183,7 @@ fn main() -> std::io::Result<()> {
                         let read_res = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut libc::c_void, BUF_SIZE) };
                         if read_res > 0 {
                             pos = read_res as usize;
-                            match process_request(client_fd, buf, pos, started_at, &app_state, &mut poll) {
-                                ProcessResult::Writing(final_state) => {
-                                    conns[client_fd as usize] = handle_greedy_write(client_fd, final_state, &mut poll, &mut free_bufs).unwrap_or(ConnState::Idle);
-                                }
-                                ProcessResult::Incomplete(returned_buf) => {
-                                    conns[client_fd as usize] = ConnState::Reading {
-                                        buf: returned_buf,
-                                        pos,
-                                        started_at,
-                                    };
-                                }
-                                ProcessResult::Closed(returned_buf) => {
-                                    free_bufs.push(returned_buf);
-                                    conns[client_fd as usize] = ConnState::Idle;
-                                }
-                            }
+                            conns[client_fd as usize] = process_pipeline(client_fd, buf, pos, started_at, &app_state, &mut poll, &mut free_bufs);
                         } else {
                             // WouldBlock or error, register for READABLE
                             poll.registry().register(
@@ -234,22 +221,7 @@ fn main() -> std::io::Result<()> {
 
                         if res > 0 {
                             let new_pos = pos + res as usize;
-                            match process_request(client_fd, buf, new_pos, started_at, &app_state, &mut poll) {
-                                ProcessResult::Writing(final_state) => {
-                                    conns[client_fd as usize] = handle_greedy_write(client_fd, final_state, &mut poll, &mut free_bufs).unwrap_or(ConnState::Idle);
-                                }
-                                ProcessResult::Incomplete(returned_buf) => {
-                                    conns[client_fd as usize] = ConnState::Reading {
-                                        buf: returned_buf,
-                                        pos: new_pos,
-                                        started_at,
-                                    };
-                                }
-                                ProcessResult::Closed(returned_buf) => {
-                                    free_bufs.push(returned_buf);
-                                    conns[client_fd as usize] = ConnState::Idle;
-                                }
-                            }
+                            conns[client_fd as usize] = process_pipeline(client_fd, buf, new_pos, started_at, &app_state, &mut poll, &mut free_bufs);
                         } else if res == 0 {
                             unsafe { libc::close(client_fd); }
                             free_bufs.push(buf);
@@ -264,9 +236,18 @@ fn main() -> std::io::Result<()> {
                         }
                     }
                 } else if event.is_writable() {
-                    if let ConnState::Writing { buf, len, written, started_at, route, status } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
-                        let final_state = ConnState::Writing { buf, len, written, started_at, route, status };
-                        conns[client_fd as usize] = handle_greedy_write(client_fd, final_state, &mut poll, &mut free_bufs).unwrap_or(ConnState::Idle);
+                    if let ConnState::Writing { buf, len, written, started_at, route, status, leftover_pos, leftover_len } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
+                        let final_state = ConnState::Writing { buf, len, written, started_at, route, status, leftover_pos, leftover_len };
+                        let next_state_opt = handle_greedy_write(client_fd, final_state, &mut poll, &mut free_bufs);
+                        if let Some(ConnState::Reading { buf: next_buf, pos: next_pos, started_at: next_started_at }) = next_state_opt {
+                            if next_pos > 0 {
+                                conns[client_fd as usize] = process_pipeline(client_fd, next_buf, next_pos, next_started_at, &app_state, &mut poll, &mut free_bufs);
+                            } else {
+                                conns[client_fd as usize] = ConnState::Reading { buf: next_buf, pos: next_pos, started_at: next_started_at };
+                            }
+                        } else {
+                            conns[client_fd as usize] = next_state_opt.unwrap_or(ConnState::Idle);
+                        }
                     }
                 }
             }
@@ -280,6 +261,48 @@ enum ProcessResult {
     Closed(Box<[u8; BUF_SIZE]>),
 }
 
+fn process_pipeline(
+    client_fd: RawFd,
+    mut buf: Box<[u8; BUF_SIZE]>,
+    mut pos: usize,
+    mut started_at: Timer,
+    app_state: &Option<AppState>,
+    poll: &mut Poll,
+    free_bufs: &mut Vec<Box<[u8; BUF_SIZE]>>
+) -> ConnState {
+    loop {
+        match process_request(client_fd, buf, pos, started_at, app_state, poll) {
+            ProcessResult::Writing(final_state) => {
+                let next_state_opt = handle_greedy_write(client_fd, final_state, poll, free_bufs);
+                if let Some(ConnState::Reading { buf: next_buf, pos: next_pos, started_at: next_started_at }) = next_state_opt {
+                    if next_pos > 0 {
+                        buf = next_buf;
+                        pos = next_pos;
+                        started_at = next_started_at;
+                        continue;
+                    } else {
+                        return ConnState::Reading { buf: next_buf, pos: next_pos, started_at: next_started_at };
+                    }
+                } else {
+                    return next_state_opt.unwrap_or(ConnState::Idle);
+                }
+            }
+            ProcessResult::Incomplete(returned_buf) => {
+                return ConnState::Reading {
+                    buf: returned_buf,
+                    pos,
+                    started_at,
+                };
+            }
+            ProcessResult::Closed(returned_buf) => {
+                free_bufs.push(returned_buf);
+                return ConnState::Idle;
+            }
+        }
+    }
+}
+
+
 fn process_request(
     client_fd: RawFd,
     mut buf: Box<[u8; BUF_SIZE]>,
@@ -289,7 +312,9 @@ fn process_request(
     poll: &mut Poll,
 ) -> ProcessResult {
     let http_timer = crate::logging::timer_start();
-    let (route, _) = parse_http_request(&buf[..pos]);
+    let (route, total_len) = parse_http_request(&buf[..pos]);
+    let leftover_pos = total_len;
+    let leftover_len = pos.saturating_sub(total_len);
     crate::api_log_timing!(Level::Info, Category::Request, "http_parse", http_timer, "fd={}", client_fd);
 
     match route {
@@ -321,6 +346,8 @@ fn process_request(
                 started_at,
                 route: "ready",
                 status: if is_ready { 200 } else { 503 },
+                leftover_pos,
+                leftover_len,
             })
         }
         HttpRoute::FraudScore(body_bytes) => {
@@ -431,6 +458,8 @@ fn process_request(
                             started_at,
                             route: "fraud-score",
                             status: 200,
+                            leftover_pos,
+                            leftover_len,
                         })
                     } else {
                         let resp = b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\n\r\n";
@@ -442,6 +471,8 @@ fn process_request(
                             started_at,
                             route: "fraud-score",
                             status: 422,
+                            leftover_pos,
+                            leftover_len,
                         })
                     }
                 } else {
@@ -454,6 +485,8 @@ fn process_request(
                         started_at,
                         route: "fraud-score",
                         status: 400,
+                        leftover_pos,
+                        leftover_len,
                     })
                 }
             } else {
@@ -466,6 +499,8 @@ fn process_request(
                     started_at,
                     route: "fraud-score",
                     status: 503,
+                    leftover_pos,
+                    leftover_len,
                 })
             }
         }
@@ -479,6 +514,8 @@ fn process_request(
                 started_at,
                 route: "not-found",
                 status: 404,
+                leftover_pos,
+                leftover_len,
             })
         }
     }
@@ -490,7 +527,7 @@ fn handle_greedy_write(
     poll: &mut Poll,
     free_bufs: &mut Vec<Box<[u8; BUF_SIZE]>>
 ) -> Option<ConnState> {
-    if let ConnState::Writing { buf, len, mut written, started_at, route, status } = state {
+    if let ConnState::Writing { mut buf, len, mut written, started_at, route, status, leftover_pos, leftover_len } = state {
         loop {
             let res = unsafe {
                 libc::write(client_fd, buf.as_ptr().add(written) as *const libc::c_void, len - written)
@@ -500,9 +537,28 @@ fn handle_greedy_write(
                 written += res as usize;
                 if written == len {
                     crate::api_log_timing!(Level::Info, Category::Request, "request_lifecycle", started_at, "fd={} route={} status={}", client_fd, route, status);
-                    unsafe { libc::close(client_fd); }
-                    free_bufs.push(buf);
-                    return None; // Fully written and closed
+                    
+                    if leftover_len > 0 {
+                        unsafe {
+                            std::ptr::copy(
+                                buf.as_ptr().add(leftover_pos),
+                                buf.as_mut_ptr(),
+                                leftover_len
+                            );
+                        }
+                    }
+                    
+                    poll.registry().reregister(
+                        &mut SourceFd(&client_fd),
+                        Token(client_fd as usize),
+                        Interest::READABLE,
+                    ).ok();
+                    
+                    return Some(ConnState::Reading {
+                        buf,
+                        pos: leftover_len,
+                        started_at: crate::logging::timer_start(),
+                    });
                 }
                 continue;
             } else {
@@ -513,7 +569,7 @@ fn handle_greedy_write(
                         Token(client_fd as usize),
                         Interest::WRITABLE,
                     ).ok();
-                    return Some(ConnState::Writing { buf, len, written, started_at, route, status });
+                    return Some(ConnState::Writing { buf, len, written, started_at, route, status, leftover_pos, leftover_len });
                 } else {
                     unsafe { libc::close(client_fd); }
                     free_bufs.push(buf);
