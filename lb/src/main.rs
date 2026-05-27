@@ -129,7 +129,10 @@ fn main() -> std::io::Result<()> {
 
                     if client_fd < 0 {
                         let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                        let raw_os_err = err.raw_os_error();
+                        if err.kind() == std::io::ErrorKind::WouldBlock 
+                            || raw_os_err == Some(libc::EMFILE) 
+                            || raw_os_err == Some(libc::ENFILE) {
                             break;
                         }
                         continue;

@@ -51,6 +51,15 @@ struct AppState {
 fn main() -> std::io::Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        
+        // Enable FTZ (Flush-To-Zero) and DAZ (Denormals-Are-Zero) to prevent massive
+        // performance penalties when AVX2 math operates on the packed ID/label bytes.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut mxcsr = std::arch::x86_64::_mm_getcsr();
+            mxcsr |= (1 << 15) | (1 << 6); // DAZ | FTZ
+            std::arch::x86_64::_mm_setcsr(mxcsr);
+        }
     }
 
     let sock_path = std::env::var("SOCK").expect("SOCK env var must be set");

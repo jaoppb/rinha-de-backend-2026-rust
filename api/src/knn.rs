@@ -218,8 +218,8 @@ impl IvfIndex {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn dist_avx2(&self, q_low: __m256, q_high: __m256, abs_mask: __m256, v2: &[f32; 16]) -> f32 {
-        let b_low = _mm256_loadu_ps(v2.as_ptr());
-        let b_high = _mm256_loadu_ps(v2.as_ptr().add(8));
+        let b_low = _mm256_load_ps(v2.as_ptr());
+        let b_high = _mm256_load_ps(v2.as_ptr().add(8));
         let diff_low = _mm256_and_ps(_mm256_sub_ps(q_low, b_low), abs_mask);
         let diff_high = _mm256_and_ps(_mm256_sub_ps(q_high, b_high), abs_mask);
         let sum_vec = _mm256_add_ps(diff_low, diff_high);
@@ -229,14 +229,14 @@ impl IvfIndex {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn dist_avx2_x4(&self, q_low: __m256, q_high: __m256, abs_mask: __m256, v0: &[f32; 16], v1: &[f32; 16], v2: &[f32; 16], v3: &[f32; 16]) -> (f32, f32, f32, f32) {
-        let b0_low = _mm256_loadu_ps(v0.as_ptr());
-        let b1_low = _mm256_loadu_ps(v1.as_ptr());
-        let b2_low = _mm256_loadu_ps(v2.as_ptr());
-        let b3_low = _mm256_loadu_ps(v3.as_ptr());
-        let b0_high = _mm256_loadu_ps(v0.as_ptr().add(8));
-        let b1_high = _mm256_loadu_ps(v1.as_ptr().add(8));
-        let b2_high = _mm256_loadu_ps(v2.as_ptr().add(8));
-        let b3_high = _mm256_loadu_ps(v3.as_ptr().add(8));
+        let b0_low = _mm256_load_ps(v0.as_ptr());
+        let b1_low = _mm256_load_ps(v1.as_ptr());
+        let b2_low = _mm256_load_ps(v2.as_ptr());
+        let b3_low = _mm256_load_ps(v3.as_ptr());
+        let b0_high = _mm256_load_ps(v0.as_ptr().add(8));
+        let b1_high = _mm256_load_ps(v1.as_ptr().add(8));
+        let b2_high = _mm256_load_ps(v2.as_ptr().add(8));
+        let b3_high = _mm256_load_ps(v3.as_ptr().add(8));
         
         let s0 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b0_low), abs_mask), _mm256_and_ps(_mm256_sub_ps(q_high, b0_high), abs_mask));
         let s1 = _mm256_add_ps(_mm256_and_ps(_mm256_sub_ps(q_low, b1_low), abs_mask), _mm256_and_ps(_mm256_sub_ps(q_high, b1_high), abs_mask));
