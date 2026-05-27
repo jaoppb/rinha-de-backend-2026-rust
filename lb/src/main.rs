@@ -33,6 +33,8 @@ fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
+    let ready_paths: Vec<String> = upstreams.iter().map(|s| format!("{}.ready", s)).collect();
+
     let mut up_addrs = Vec::with_capacity(upstreams.len());
     for ups in upstreams {
         let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
@@ -87,6 +89,17 @@ fn main() -> std::io::Result<()> {
     );
 
     let mut rr = 0;
+
+    // Wait for all upstreams to signal readiness
+    eprintln!("Waiting for {} upstreams to be ready...", ready_paths.len());
+    loop {
+        let all_ready = ready_paths.iter().all(|p| std::path::Path::new(p).exists());
+        if all_ready {
+            eprintln!("All upstreams ready!");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 
     loop {
         poll.poll(&mut events, None)?;
