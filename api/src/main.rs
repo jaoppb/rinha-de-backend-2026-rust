@@ -110,12 +110,12 @@ fn main() -> std::io::Result<()> {
         let d = load_dataset().expect("Failed to load dataset");
         let i = load_ivf_data().expect("Failed to load IVF data");
         
-        // Warm up memory maps
+        // Warm up memory maps fully to prevent page faults in the single-threaded event loop
         let mut sum = 0.0f32;
-        for r in d.records.iter().take(1000) { sum += r.vector[0] as f32; }
+        for r in d.records.iter() { sum += r.vector[0]; }
         for c in i.l1_centroids.iter() { sum += c[0]; }
-        for c in i.l2_centroids.iter().take(1000) { sum += c[0]; }
-        for o in i.offsets.iter().take(1000) { sum += *o as f32; }
+        for c in i.l2_centroids.iter() { sum += c[0]; }
+        for o in i.offsets.iter() { sum += *o as f32; }
         println!("Warmup complete (dummy sum: {})", sum);
 
         let _ = tx.send((l, d, i));
@@ -212,13 +212,18 @@ fn main() -> std::io::Result<()> {
                 
                 if event.is_readable() {
                     if let ConnState::Reading { mut buf, pos, started_at } = mem::replace(&mut conns[client_fd as usize], ConnState::Idle) {
+                        let actual_started_at = if pos == 0 {
+                            crate::logging::timer_start()
+                        } else {
+                            started_at
+                        };
                         let res = unsafe {
                             libc::read(client_fd, buf.as_mut_ptr().add(pos) as *mut libc::c_void, BUF_SIZE - pos)
                         };
 
                         if res > 0 {
                             let new_pos = pos + res as usize;
-                            conns[client_fd as usize] = process_pipeline(client_fd, buf, new_pos, started_at, &app_state, &mut poll, &mut free_bufs);
+                            conns[client_fd as usize] = process_pipeline(client_fd, buf, new_pos, actual_started_at, &app_state, &mut poll, &mut free_bufs);
                         } else if res == 0 {
                             unsafe { libc::close(client_fd); }
                             free_bufs.push(buf);

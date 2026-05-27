@@ -13,8 +13,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.2'
-          memory: '20M'
+          cpus: '0.15'
+          memory: '10M'
 
   api1: &api
     image: jaoppb/rinha-2026-rust:latest
@@ -29,7 +29,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.4'
+          cpus: '0.425'
           memory: '165M'
 
   api2:
