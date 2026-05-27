@@ -108,16 +108,26 @@ fn main() -> std::io::Result<()> {
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let _t_lookups = crate::logging::timer_start();
         let l = load_lookups();
+        crate::api_log_timing!(Level::Info, Category::IoUring, "load_lookups", _t_lookups, "");
+
+        let _t_dataset = crate::logging::timer_start();
         let d = load_dataset().expect("Failed to load dataset");
+        crate::api_log_timing!(Level::Info, Category::IoUring, "load_dataset", _t_dataset, "");
+
+        let _t_ivf = crate::logging::timer_start();
         let i = load_ivf_data().expect("Failed to load IVF data");
+        crate::api_log_timing!(Level::Info, Category::IoUring, "load_ivf_data", _t_ivf, "");
         
         // Warm up memory maps fully to prevent page faults in the single-threaded event loop
+        let _t_warmup = crate::logging::timer_start();
         let mut sum = 0.0f32;
         for r in d.records.iter() { sum += r.vector[0]; }
         for c in i.l1_centroids.iter() { sum += c[0]; }
         for c in i.l2_centroids.iter() { sum += c[0]; }
         for o in i.offsets.iter() { sum += *o as f32; }
+        crate::api_log_timing!(Level::Info, Category::IoUring, "memory_warmup", _t_warmup, "dummy sum={}", sum);
         println!("Warmup complete (dummy sum: {})", sum);
 
         let _ = tx.send((l, d, i));
@@ -170,10 +180,12 @@ fn main() -> std::io::Result<()> {
             uds_budget -= 1;
             unsafe {
                 msg.msg_controllen = cmsg_buf.len() as _;
+                let _recvmsg_timer = crate::logging::timer_start();
                 let res = libc::recvmsg(uds_fd, &mut msg, 0);
                 if res < 0 {
                     break;
                 }
+                crate::api_log_timing!(Level::Info, Category::IoUring, "syscall_recvmsg", _recvmsg_timer, "res={}", res);
 
                 let cmsg = libc::CMSG_FIRSTHDR(&msg);
                 if !cmsg.is_null()
@@ -187,7 +199,9 @@ fn main() -> std::io::Result<()> {
                         let started_at = crate::logging::timer_start();
 
                         // Greedy Read
-                        let read_res = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut libc::c_void, BUF_SIZE) };
+                        let _read_timer = crate::logging::timer_start();
+                        let read_res = libc::read(client_fd, buf.as_mut_ptr() as *mut libc::c_void, BUF_SIZE);
+                        crate::api_log_timing!(Level::Info, Category::IoUring, "syscall_read_greedy", _read_timer, "fd={} res={}", client_fd, read_res);
                         if read_res > 0 {
                             pos = read_res as usize;
                             conns[client_fd as usize] = process_pipeline(client_fd, buf, pos, started_at, &app_state, &mut poll, &mut free_bufs, &mut fd_registered);
@@ -228,9 +242,11 @@ fn main() -> std::io::Result<()> {
                         } else {
                             started_at
                         };
+                        let _read_timer = crate::logging::timer_start();
                         let res = unsafe {
                             libc::read(client_fd, buf.as_mut_ptr().add(pos) as *mut libc::c_void, BUF_SIZE - pos)
                         };
+                        crate::api_log_timing!(Level::Info, Category::IoUring, "syscall_read", _read_timer, "fd={} res={}", client_fd, res);
 
                         if res > 0 {
                             let new_pos = pos + res as usize;
@@ -328,11 +344,11 @@ fn process_request(
     poll: &mut Poll,
     fd_registered: &mut [bool; MAX_FDS],
 ) -> ProcessResult {
-    let http_timer = crate::logging::timer_start();
+    let _http_timer = crate::logging::timer_start();
     let (route, total_len) = parse_http_request(&buf[..pos]);
     let leftover_pos = total_len;
     let leftover_len = pos.saturating_sub(total_len);
-    crate::api_log_timing!(Level::Info, Category::Request, "http_parse", http_timer, "fd={}", client_fd);
+    crate::api_log_timing!(Level::Info, Category::Request, "http_parse", _http_timer, "fd={}", client_fd);
 
     match route {
         HttpRoute::Incomplete => {
@@ -379,17 +395,17 @@ fn process_request(
         }
         HttpRoute::FraudScore(body_bytes) => {
             if let Some(state) = app_state {
-                let json_timer = crate::logging::timer_start();
+                let _json_timer = crate::logging::timer_start();
                 let tx = if body_bytes.is_empty() { None } else { parse_json_payload(body_bytes) };
-                crate::api_log_timing!(Level::Info, Category::Request, "json_parse", json_timer, "fd={}", client_fd);
+                crate::api_log_timing!(Level::Info, Category::Request, "json_parse", _json_timer, "fd={}", client_fd);
 
                 if let Some(tx) = tx {
-                    let vec_timer = crate::logging::timer_start();
+                    let _vec_timer = crate::logging::timer_start();
                     let vec_opt = vectorize(&tx, &state.lookups);
-                    crate::api_log_timing!(Level::Info, Category::Request, "vectorize", vec_timer, "fd={}", client_fd);
+                    crate::api_log_timing!(Level::Info, Category::Request, "vectorize", _vec_timer, "fd={}", client_fd);
 
                     if let Some(vec) = vec_opt {
-                        let knn_timer = crate::logging::timer_start();
+                        let _knn_timer = crate::logging::timer_start();
                         
                         let mut lookup_res = None;
                         if let Some(id_str) = std::str::from_utf8(tx.id).ok() {
@@ -409,8 +425,9 @@ fn process_request(
                             state.index.search(&vec, state.dataset.records)
                         };
 
-                        crate::api_log_timing!(Level::Info, Category::Request, "knn_search", knn_timer, "fd={}", client_fd);
+                        crate::api_log_timing!(Level::Info, Category::Request, "knn_search", _knn_timer, "fd={}", client_fd);
                         
+                        let _format_timer = crate::logging::timer_start();
                         let mut out_pos = 0;
                         
                         let mut body_buf = [0u8; 64];
@@ -477,6 +494,7 @@ fn process_request(
                         
                         buf[out_pos..out_pos+body.len()].copy_from_slice(body);
                         out_pos += body.len();
+                        crate::api_log_timing!(Level::Info, Category::Request, "response_format", _format_timer, "fd={}", client_fd);
 
                         return ProcessResult::Writing(ConnState::Writing {
                             buf,
@@ -557,9 +575,11 @@ fn handle_greedy_write(
 ) -> Option<ConnState> {
     if let ConnState::Writing { mut buf, len, mut written, started_at, route, status, leftover_pos, leftover_len } = state {
         loop {
+            let _write_timer = crate::logging::timer_start();
             let res = unsafe {
                 libc::write(client_fd, buf.as_ptr().add(written) as *const libc::c_void, len - written)
             };
+            crate::api_log_timing!(Level::Info, Category::IoUring, "syscall_write", _write_timer, "fd={} res={}", client_fd, res);
 
             if res > 0 {
                 written += res as usize;

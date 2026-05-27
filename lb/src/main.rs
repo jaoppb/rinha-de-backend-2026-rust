@@ -92,6 +92,7 @@ fn main() -> std::io::Result<()> {
 
     // Wait for all upstreams to signal readiness
     eprintln!("Waiting for {} upstreams to be ready...", ready_paths.len());
+    let upstream_wait_timer = logging::timer_start();
     loop {
         let all_ready = ready_paths.iter().all(|p| std::path::Path::new(p).exists());
         if all_ready {
@@ -100,6 +101,13 @@ fn main() -> std::io::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    logging::log_timing(
+        Level::Info,
+        Category::IoUring,
+        "upstream_wait",
+        upstream_wait_timer,
+        format_args!("count={}", ready_paths.len()),
+    );
 
     loop {
         poll.poll(&mut events, None)?;
