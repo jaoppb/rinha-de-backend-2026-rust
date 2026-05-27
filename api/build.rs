@@ -69,38 +69,4 @@ fn main() {
     .unwrap();
     writeln!(f, "}};").unwrap();
 
-    // 3. Process Test Data (Optional)
-    let test_json_path = "../test/test-data.json";
-    let mut test_labels = Vec::new();
-    if Path::new(test_json_path).exists() {
-        println!("cargo:rerun-if-changed={}", test_json_path);
-        if let Ok(file) = File::open(test_json_path) {
-            #[derive(Deserialize)]
-            struct TestData {
-                entries: Vec<TestEntry>,
-            }
-            #[derive(Deserialize)]
-            struct TestEntry {
-                request: TestRequest,
-                expected_approved: bool,
-            }
-            #[derive(Deserialize)]
-            struct TestRequest {
-                id: String,
-            }
-
-            if let Ok(data) = serde_json::from_reader::<_, TestData>(file) {
-                for entry in data.entries {
-                    if let Some(id_str) = entry.request.id.strip_prefix("tx-") {
-                        if let Ok(id_num) = id_str.parse::<u32>() {
-                            test_labels.push((id_num, entry.expected_approved));
-                        }
-                    }
-                }
-                test_labels.sort_by_key(|&(id, _)| id);
-            }
-        }
-    }
-
-    writeln!(f, "pub static TEST_LABELS: &[(u32, bool)] = &{:?};", test_labels).unwrap();
 }

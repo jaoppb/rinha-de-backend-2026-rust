@@ -86,6 +86,9 @@ Testing is primarily done via `k6` scripts in the `test/` directory.
   microarchitecture) and 8GB RAM (<https://support.apple.com/en-us/111931>).
   This means AVX2 is the maximum supported vector extension; AVX-512 is not
   available.
+- **Forbidden Test Data:** Usage of `test/test-data.json` is STRICTLY FORBIDDEN
+  for any implementation, build, or deployment logic. It must only be used by
+  the test scripts.
 
 ## Documentation
 
